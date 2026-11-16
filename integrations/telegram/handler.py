@@ -1,31 +1,32 @@
-"""Telegram command surface — authorization, intents, and replies."""
+"""Telegram command & callback surface — auth, inline approvals, progress, and artifact delivery."""
 from __future__ import annotations
 
 import logging
 import re
 from pathlib import Path
 
-from agents.registry import AGENT_NAMES
-from integrations.telegram.bot import TelegramBot, is_authorized, temp_upload_path
+from integrations.telegram.bot import TelegramBot, extract_user_id, is_authorized, temp_upload_path
 from security.secret_manager import redact
 
 log = logging.getLogger("telegram.handler")
 
 HELP = """*Phone AI Agent Team* — commands
-/new <name> — create a project and plan the pipeline
-/status [id] — project state and task list
-/agents — the 16 agents
-/pause /resume — control the worker pool
+/new <name> [blueprint] — create a project (starts immediately if blueprint included, else waits for text/file)
+/build [id] — start or replan dynamic pipeline for active project
+/status [id] — project lifecycle, category & task statuses
+/agents — list all 16 specialist agents & current state
+/pause /resume — pause or resume the worker pool
 /stop <id> — cancel a project
 /approve <id> /reject <id> — decide a pending approval
-/pending — list pending approvals
-/logs [id] — recent execution logs
-/report [id] — completion report
-/projects — all projects
-/recover <id> — requeue interrupted/failed tasks
+/pending — list pending approvals with inline buttons
+/logs [id] — recent redacted execution logs
+/report [id] — completion & AI usage report
+/artifact [id] — download packaged project ZIP archive
+/projects — list recent projects
+/recover <id> — requeue interrupted or failed tasks
 /settings — runtime configuration (no secrets)
-/health — database + provider status
-Send TXT/MD/PDF/DOCX/JSON/ZIP to attach a blueprint."""
+/health — AI router, database & Android resource status
+Send TXT/MD/PDF/DOCX/JSON/CSV/ZIP to attach a blueprint."""
 
 MAX_TG = 3900
 
@@ -34,18 +35,75 @@ class TelegramHandler:
     def __init__(self, engine, settings):
         self.engine = engine
         self.settings = settings
-        self.current: dict[int, str] = {}   # chat_id → active project id
+        self.current: dict[int, str] = {}   # chat_id -> active project id
+        self._project_chats: dict[str, int] = {}
+        self._bot: TelegramBot | None = None
+        self._default_chat_id: int = int(getattr(settings, "telegram_allowed_user_id", 0) or 0)
+        self._seen_callback_ids: set[str] = set()
 
-    # ---------- entry point ----------
+    def bind_bot(self, bot: TelegramBot, default_chat_id: int | None = None) -> None:
+        """Connect OrchestratorEngine progress, approval, and completion events to Telegram."""
+        self._bot = bot
+        if default_chat_id:
+            self._default_chat_id = int(default_chat_id)
+        self.engine.set_progress_callback(self._on_engine_progress)
+        self.engine.set_approval_callback(self._on_engine_approval)
+        self.engine.set_completion_callback(self._on_engine_completion)
+
+    def _chat_for_project(self, project_id: str) -> int:
+        return self._project_chats.get(project_id) or self._default_chat_id
+
+    def _on_engine_progress(self, project_id: str, message: str) -> None:
+        if self._bot is None:
+            return
+        chat_id = self._chat_for_project(project_id)
+        if not chat_id:
+            return
+        # Deliver key milestones and errors without flooding every sub-second tick
+        if any(message.startswith(p) for p in ("Planned ", "✗ ", "↻ ", "⚠️", "⏸", "♻️", "🔄")):
+            self._bot.send_message(chat_id, f"[{project_id}] {message}")
+
+    def _on_engine_approval(self, approval_row: dict) -> None:
+        if self._bot is None:
+            return
+        pid = approval_row.get("project_id", "")
+        chat_id = self._chat_for_project(pid)
+        if chat_id:
+            self._bot.send_approval_prompt(chat_id, approval_row)
+
+    def _on_engine_completion(self, project_id: str, report_text: str, zip_path: str) -> None:
+        if self._bot is None:
+            return
+        chat_id = self._chat_for_project(project_id)
+        if not chat_id:
+            return
+        self._bot.send_message(chat_id, f"🎉 Build complete!\n\n{report_text}")
+        if zip_path and Path(zip_path).is_file():
+            self._bot.send_document(chat_id, zip_path, caption=f"Deliverable archive for {project_id}")
+
+    # ---------- main update router ----------
     def __call__(self, bot: TelegramBot, update: dict) -> None:
         if not is_authorized(update, self.settings.telegram_allowed_user_id):
-            msg = update.get("message") or {}
+            uid = extract_user_id(update)
+            if "callback_query" in update:
+                cb = update.get("callback_query") or {}
+                data = str(cb.get("data") or "")
+                aid = data.split(":", 1)[1] if ":" in data else ""
+                self.engine.approvals.record_unauthorized(aid, actor=str(uid or "unknown"), detail=data)
+                if cb.get("id"):
+                    bot.answer_callback_query(cb["id"], "⛔ Not authorized.", show_alert=True)
+                log.warning("rejected unauthorized callback_query from user %s", uid)
+                return
+            msg = update.get("message") or update.get("edited_message") or {}
             chat = (msg.get("chat") or {}).get("id")
             if chat:
                 bot.send_message(chat, "⛔ Not authorized.")
-                log.warning("rejected unauthorized update from user %s",
-                            (msg.get("from") or {}).get("id"))
+                log.warning("rejected unauthorized update from user %s", uid)
             return
+
+        if "callback_query" in update:
+            return self._handle_callback_query(bot, update["callback_query"])
+
         msg = update.get("message") or {}
         chat_id = (msg.get("chat") or {}).get("id")
         if chat_id is None:
@@ -68,18 +126,76 @@ class TelegramHandler:
             log.exception("command %s failed", command)
             bot.send_message(chat_id, f"⚠️ {command} failed: {redact(str(e))[:300]}")
 
+    # ---------- inline approval callbacks ----------
+    def _handle_callback_query(self, bot: TelegramBot, cb: dict) -> None:
+        cb_id = str(cb.get("id") or "")
+        data = str(cb.get("data") or "").strip()
+        user_id = str((cb.get("from") or {}).get("id") or "")
+        msg = cb.get("message") or {}
+        chat_id = (msg.get("chat") or {}).get("id")
+        message_id = msg.get("message_id")
+
+        # Duplicate callback_query_id protection
+        if cb_id and cb_id in self._seen_callback_ids:
+            bot.answer_callback_query(cb_id, "Duplicate callback ignored.")
+            return
+        if cb_id:
+            if len(self._seen_callback_ids) > 2000:
+                self._seen_callback_ids.clear()
+            self._seen_callback_ids.add(cb_id)
+
+        if ":" not in data:
+            if cb_id:
+                bot.answer_callback_query(cb_id, "Unsupported action.")
+            return
+        verb, aid = data.split(":", 1)
+        verb = verb.lower().strip()
+        aid = aid.strip()
+
+        if verb not in ("approve", "reject") or not aid:
+            if cb_id:
+                bot.answer_callback_query(cb_id, "Invalid callback payload.")
+            return
+
+        approved = (verb == "approve")
+        ok = (
+            self.engine.approvals.approve(aid, by=user_id)
+            if approved
+            else self.engine.approvals.reject(aid, by=user_id)
+        )
+        if not ok:
+            status_now = self.engine.approvals.status(aid) or "UNKNOWN"
+            if cb_id:
+                bot.answer_callback_query(
+                    cb_id, f"Cannot {verb}: approval is {status_now}.", show_alert=True
+                )
+            if chat_id:
+                bot.send_message(chat_id, f"⚠️ Approval `{aid}` could not be changed (status: {status_now}).")
+            return
+
+        self.engine.on_approval_decided(aid, approved=approved)
+        if cb_id:
+            bot.answer_callback_query(cb_id, f"{'Approved' if approved else 'Rejected'} {aid}")
+        if chat_id and message_id:
+            bot.clear_inline_buttons(chat_id, message_id)
+        if chat_id:
+            icon = "✅" if approved else "❌"
+            bot.send_message(chat_id, f"{icon} {'Approved' if approved else 'Rejected'} `{aid}`.")
+
     # ---------- commands ----------
     def _commands(self) -> dict:
         return {
             "/start": self._cmd_start, "/help": self._cmd_help,
-            "/new": self._cmd_new, "/status": self._cmd_status,
-            "/agents": self._cmd_agents, "/pause": self._cmd_pause,
-            "/resume": self._cmd_resume, "/stop": self._cmd_stop,
+            "/new": self._cmd_new, "/build": self._cmd_build,
+            "/status": self._cmd_status, "/agents": self._cmd_agents,
+            "/pause": self._cmd_pause, "/resume": self._cmd_resume,
+            "/stop": self._cmd_stop, "/cancel": self._cmd_stop,
             "/approve": self._cmd_approve, "/reject": self._cmd_reject,
             "/pending": self._cmd_pending, "/logs": self._cmd_logs,
-            "/report": self._cmd_report, "/projects": self._cmd_projects,
+            "/report": self._cmd_report, "/artifact": self._cmd_artifact,
+            "/download": self._cmd_artifact, "/projects": self._cmd_projects,
             "/recover": self._cmd_recover, "/settings": self._cmd_settings,
-            "/health": self._cmd_health, "/cancel": self._cmd_stop,
+            "/health": self._cmd_health,
         }
 
     def _project_id(self, chat_id: int, arg: str) -> str:
@@ -92,12 +208,56 @@ class TelegramHandler:
         bot.send_message(chat_id, HELP)
 
     def _cmd_new(self, bot, chat_id, arg):
-        name = re.sub(r"[^A-Za-z0-9 _-]", "", arg or "")[:40] or "project"
-        pid = self.engine.create_project(name, requirements=f"Project: {name}", quick=False)
+        raw = (arg or "").strip()
+        # Split `/new <name> <optional blueprint...>` or `/new <name>: <blueprint>`
+        if ":" in raw:
+            head, tail = raw.split(":", 1)
+            name_part, blueprint = head.strip(), tail.strip()
+        else:
+            tokens = raw.split(None, 1)
+            name_part = tokens[0] if tokens else "project"
+            blueprint = tokens[1].strip() if len(tokens) > 1 else ""
+
+        name = re.sub(r"[^A-Za-z0-9 _-]", "", name_part)[:40] or "project"
+        has_inline_blueprint = len(blueprint) >= 8
+        pid = self.engine.create_project(
+            name,
+            requirements=blueprint if has_inline_blueprint else f"Project: {name}",
+            quick=False,
+            auto_start=has_inline_blueprint,
+        )
         self.current[chat_id] = pid
-        bot.send_message(chat_id, f"✅ Project `{pid}` created and planned.\n"
-                                  f"Send requirements or attach a file to add detail.\n"
-                                  f"Track it with /status {pid}")
+        self._project_chats[pid] = chat_id
+
+        if has_inline_blueprint:
+            st = self.engine.status(pid)
+            stype = (st.get("blueprint_analysis") or {}).get("software_type", "web_app")
+            bot.send_message(
+                chat_id,
+                f"✅ Project `{pid}` ({name}) created and dynamically planned as `{stype}`.\n"
+                f"Planned {len(st['tasks'])} tasks. Track with /status {pid}",
+            )
+        else:
+            bot.send_message(
+                chat_id,
+                f"✅ Project `{pid}` ({name}) initialized.\n"
+                f"Send your blueprint requirements as text or attach a file (TXT/MD/PDF/DOCX/JSON/CSV/ZIP) "
+                f"to dynamically plan and start the build, or run /build {pid}.",
+            )
+
+    def _cmd_build(self, bot, chat_id, arg):
+        pid = self._project_id(chat_id, arg)
+        if not pid:
+            return bot.send_message(chat_id, "Usage: /build <project_id>")
+        res = self.engine.replan_project(pid)
+        if not res.get("ok"):
+            return bot.send_message(chat_id, f"⚠️ {res.get('error')}")
+        st = self.engine.status(pid)
+        stype = (st.get("blueprint_analysis") or {}).get("software_type", "web_app")
+        bot.send_message(
+            chat_id,
+            f"🚀 Project `{pid}` planned (`{stype}`, {len(st['tasks'])} tasks) and workers started.",
+        )
 
     def _cmd_status(self, bot, chat_id, arg):
         pid = self._project_id(chat_id, arg)
@@ -106,10 +266,19 @@ class TelegramHandler:
         st = self.engine.status(pid)
         if not st["project"]:
             return bot.send_message(chat_id, f"Unknown project: {pid}")
-        lines = [f"*{st['project']['name']}* — {st['lifecycle']}", ""]
+        analysis = st.get("blueprint_analysis") or {}
+        stype = analysis.get("software_type")
+        header = f"*{st['project']['name']}* (`{pid}`) — {st['lifecycle']}"
+        if stype:
+            header += f" [{stype}]"
+        lines = [header, ""]
+        if not st["tasks"]:
+            lines.append("⏳ Waiting for blueprint text or file upload (or /build).")
         for t in st["tasks"]:
-            icon = {"COMPLETED": "✅", "FAILED": "❌", "EXECUTING": "▶️",
-                    "QUEUED": "⏳", "CANCELLED": "🚫"}.get(t["status"], "•")
+            icon = {
+                "COMPLETED": "✅", "FAILED": "❌", "EXECUTING": "▶️",
+                "QUEUED": "⏳", "CANCELLED": "🚫", "SKIPPED": "⏭️",
+            }.get(t["status"], "•")
             extra = f" (retry {t['retries']})" if t["retries"] else ""
             lines.append(f"{icon} {t['agent']}{extra}")
         if st["pending_approvals"]:
@@ -117,8 +286,12 @@ class TelegramHandler:
         bot.send_message(chat_id, "\n".join(lines))
 
     def _cmd_agents(self, bot, chat_id, arg):
-        body = "\n".join(f"{i}. {name}" for i, name in enumerate(AGENT_NAMES.values(), 1))
-        bot.send_message(chat_id, "*16 agents*\n" + body)
+        rows = self.engine.agent_statuses()
+        body = "\n".join(
+            f"{i:02d}. {r['name']} (`{r['id']}`) — {r['status']}"
+            for i, r in enumerate(rows, 1)
+        )
+        bot.send_message(chat_id, "*16 Specialist Agents*\n" + body)
 
     def _cmd_pause(self, bot, chat_id, arg):
         self.engine.pause()
@@ -138,29 +311,45 @@ class TelegramHandler:
     def _cmd_approve(self, bot, chat_id, arg):
         if not arg:
             return bot.send_message(chat_id, "Usage: /approve <approval_id>")
-        ok = self.engine.approvals.approve(arg, by=str(chat_id))
-        bot.send_message(chat_id, f"✅ Approved {arg}." if ok else f"No pending approval {arg}.")
+        aid = arg.split()[0]
+        ok = self.engine.approvals.approve(aid, by=str(chat_id))
+        if ok:
+            self.engine.on_approval_decided(aid, approved=True)
+            bot.send_message(chat_id, f"✅ Approved {aid}.")
+        else:
+            bot.send_message(chat_id, f"No pending approval {aid}.")
 
     def _cmd_reject(self, bot, chat_id, arg):
         if not arg:
             return bot.send_message(chat_id, "Usage: /reject <approval_id>")
-        ok = self.engine.approvals.reject(arg, by=str(chat_id))
-        bot.send_message(chat_id, f"❌ Rejected {arg}." if ok else f"No pending approval {arg}.")
+        aid = arg.split()[0]
+        ok = self.engine.approvals.reject(aid, by=str(chat_id))
+        if ok:
+            self.engine.on_approval_decided(aid, approved=False)
+            bot.send_message(chat_id, f"❌ Rejected {aid}.")
+        else:
+            bot.send_message(chat_id, f"No pending approval {aid}.")
 
     def _cmd_pending(self, bot, chat_id, arg):
         rows = self.engine.approvals.pending(self._project_id(chat_id, arg) or None)
         if not rows:
             return bot.send_message(chat_id, "No pending approvals.")
-        body = "\n".join(f"`{r['id']}` — {r['action']}: {r['detail'][:80]}" for r in rows)
-        bot.send_message(chat_id, body)
+        for r in rows[:5]:
+            bot.send_approval_prompt(chat_id, r)
 
     def _cmd_logs(self, bot, chat_id, arg):
         pid = self._project_id(chat_id, arg)
-        query = ("SELECT l.message, l.level FROM execution_logs l "
-                 "JOIN executions e ON e.id = l.execution_id "
-                 "WHERE e.project_id = ? ORDER BY l.id DESC LIMIT 20") if pid else \
-                ("SELECT message, level FROM execution_logs ORDER BY id DESC LIMIT 20", )
-        rows = self.engine.db.query(query, (pid,) if pid else ())
+        if pid:
+            sql = (
+                "SELECT l.message, l.level FROM execution_logs l "
+                "JOIN executions e ON e.id = l.execution_id "
+                "WHERE e.project_id = ? ORDER BY l.id DESC LIMIT 20"
+            )
+            params = (pid,)
+        else:
+            sql = "SELECT message, level FROM execution_logs ORDER BY id DESC LIMIT 20"
+            params = ()
+        rows = self.engine.db.query(sql, params)
         if not rows:
             return bot.send_message(chat_id, "No logs yet.")
         body = "\n".join(f"[{r['level'][:4]}] {r['message'][:160]}" for r in reversed(rows))
@@ -171,6 +360,17 @@ class TelegramHandler:
         if not pid:
             return bot.send_message(chat_id, "Usage: /report <project_id>")
         bot.send_message(chat_id, self.engine.report(pid))
+
+    def _cmd_artifact(self, bot: TelegramBot, chat_id: int, arg: str):
+        pid = self._project_id(chat_id, arg)
+        if not pid:
+            return bot.send_message(chat_id, "Usage: /artifact <project_id>")
+        zip_path = self.engine.deliverable_zip_path(pid)
+        if not zip_path or not Path(zip_path).is_file():
+            return bot.send_message(chat_id, f"No deliverable archive available for {pid}.")
+        res = bot.send_document(chat_id, zip_path, caption=f"Deliverable archive for {pid}")
+        if not res.get("ok"):
+            bot.send_message(chat_id, f"⚠️ Could not upload archive: {res.get('error', 'unknown')}")
 
     def _cmd_projects(self, bot, chat_id, arg):
         rows = self.engine.db.list_projects()[:15]
@@ -186,16 +386,21 @@ class TelegramHandler:
         res = self.engine.recover(pid)
         if not res.get("ok"):
             return bot.send_message(chat_id, f"⚠️ {res.get('error')}")
-        bot.send_message(chat_id, f"♻️ Recovered {pid}: {res['interrupted']} interrupted, "
-                                  f"{res['requeued']} failed task(s) requeued.")
+        bot.send_message(
+            chat_id,
+            f"♻️ Recovered {pid}: {res['interrupted']} interrupted, "
+            f"{res['requeued']} failed task(s) requeued.",
+        )
 
     def _cmd_settings(self, bot, chat_id, arg):
         s = self.settings
         h = self.engine.router.health()
         providers = ", ".join(f"{k}={v['status']}" for k, v in h["providers"].items())
+        eff_workers = self.engine.resources.effective_worker_limit(s.max_concurrent_workers)
         bot.send_message(chat_id, "\n".join([
-            f"Workers: {s.max_concurrent_workers}",
+            f"Workers: {eff_workers} (configured max={s.max_concurrent_workers})",
             f"Task timeout: {s.task_timeout_seconds}s",
+            f"Approval TTL: {s.approval_ttl_seconds}s",
             f"Upload limit: {s.max_upload_mb}MB",
             f"Providers: {providers}",
             f"AI mode: {h['mode']}",
@@ -205,37 +410,56 @@ class TelegramHandler:
 
     def _cmd_health(self, bot, chat_id, arg):
         h = self.engine.router.health()
+        snap = self.engine.resources.snapshot()
         try:
-            counts = self.engine.db.query(
-                "SELECT status, COUNT(*) n FROM tasks GROUP BY status")
+            counts = self.engine.db.query("SELECT status, COUNT(*) n FROM tasks GROUP BY status")
         except Exception:
             counts = []
         body = [f"AI mode: *{h['mode']}*"]
         body += [f"{k}: {v['status']} ({v['model']})" for k, v in h["providers"].items()]
+        mem = snap["memory"]
+        disk = snap["storage"]
+        body.append(
+            f"RAM avail: {mem['available_mb']}MB | Process RSS: {mem['process_rss_mb']}MB | "
+            f"Disk free: {disk['free_mb']}MB"
+        )
         if counts:
             body.append("Tasks: " + ", ".join(f"{c['status']}={c['n']}" for c in counts))
         bot.send_message(chat_id, "\n".join(body))
 
-    # ---------- free text & files ----------
+    # ---------- free text & blueprint uploads ----------
     def _append_requirements(self, bot, chat_id, text: str) -> None:
         pid = self.current.get(chat_id)
         if not pid:
             return bot.send_message(chat_id, "Use /new <name> first, then send requirements.")
-        self.engine._append_requirements(pid, text)
-        bot.send_message(chat_id, "📝 Requirements appended to the project.")
+        self._project_chats[pid] = chat_id
+        was_waiting = (self.engine.lifecycle.get(pid) == "INPUT_RECEIVED"
+                       and not self.engine.db.list_tasks(pid))
+        res = self.engine.replan_project(pid, additional_requirements=text)
+        if was_waiting and res.get("ok"):
+            st = self.engine.status(pid)
+            stype = (st.get("blueprint_analysis") or {}).get("software_type", "web_app")
+            bot.send_message(
+                chat_id,
+                f"📝 Blueprint saved and dynamically planned as `{stype}` "
+                f"({len(st['tasks'])} tasks). Workers started!",
+            )
+        else:
+            bot.send_message(chat_id, "📝 Requirements appended and pipeline updated.")
 
     def _handle_document(self, bot: TelegramBot, chat_id: int, doc: dict) -> None:
         name = Path(doc.get("file_name") or "upload.bin").name
         pid = self.current.get(chat_id)
         if not pid:
             return bot.send_message(chat_id, "Use /new <name> first, then attach the file.")
+        self._project_chats[pid] = chat_id
         suffix = Path(name).suffix
         tmp = temp_upload_path(suffix)
         ok, msg = bot.download_file(doc["file_id"], tmp)
         if not ok:
             return bot.send_message(chat_id, f"⛔ Download refused: {msg}")
         try:
-            ok, msg = self.engine.ingest_upload(pid, tmp, name)
+            ok, msg = self.engine.ingest_upload(pid, tmp, name, auto_plan_if_waiting=True)
         finally:
             try:
                 Path(tmp).unlink()
