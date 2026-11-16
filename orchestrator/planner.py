@@ -243,7 +243,7 @@ class BlueprintAnalyzer:
             wants_db = False
 
         wants_ext_api = (
-            software_type == "web_app"
+            software_type in ("web_app", "rest_api")
             or any(k in low for k in (
                 "external api", "third-party", "webhook", "http client", "fetch from",
                 "integrate with", "integration", "weather", "github api", "stripe", "oauth",
@@ -288,29 +288,52 @@ class BlueprintAnalyzer:
 
     @staticmethod
     def _detect_category(low: str) -> str:
+        # Remove negated UI phrases before testing positive web/UI keywords
+        cleaned_ui = low
+        for neg in ("no frontend", "without frontend", "no web ui", "no ui", "without ui", "headless"):
+            cleaned_ui = cleaned_ui.replace(neg, " ")
+
+        has_positive_web_ui = any(
+            w in cleaned_ui for w in (
+                "full-stack", "fullstack", "frontend", "spa", "dashboard",
+                "html", "css", "browser ui", "ui screen", "react", "vue",
+            )
+        )
+
         # Explicit category cues ordered from most specific to broadest
-        if any(k in low for k in ("android app", "kotlin app", "apk", "jetpack compose",
-                                  "android application", "android studio")):
+        if any(k in low for k in (
+            "android app", "android mobile", "kotlin app", "kotlin android",
+            "native kotlin", "apk", "jetpack compose", "android application", "android studio",
+        )):
             return "android_app"
-        if any(k in low for k in ("desktop app", "desktop gui", "tkinter", "pyqt", "wxpython",
-                                  "desktop application")):
+        if any(k in low for k in (
+            "desktop app", "desktop gui", "tkinter", "pyqt", "wxpython", "desktop application",
+        )):
             return "desktop_app"
-        if any(k in low for k in ("cli tool", "command-line", "command line", "terminal tool",
-                                  "argparse", "cli utility", "cli app")):
+        if any(k in low for k in (
+            "cli tool", "command-line", "command line", "terminal tool",
+            "argparse", "cli utility", "cli app",
+        )):
             return "cli_tool"
-        if any(k in low for k in ("python library", "python package", "reusable library",
-                                  "sdk module", "pip package", "utility library")):
+        if any(k in low for k in (
+            "python library", "python package", "python sdk", "sdk package",
+            "reusable library", "reusable pure python", "sdk module", "pip package", "utility library",
+        )):
             return "python_library"
-        if any(k in low for k in ("rest api", "json api", "api server", "microservice",
-                                  "api-only", "api only", "headless api")) and not any(
-            w in low for w in ("frontend", "spa", "web dashboard", "html page", "ui screen")
-        ):
+        if any(k in low for k in (
+            "rest api", "json api", "api server", "microservice",
+            "api-only", "api only", "headless api",
+        )) and not has_positive_web_ui:
             return "rest_api"
-        if any(k in low for k in ("background worker", "backend service", "daemon service",
-                                  "queue worker", "webhook processor")) and "frontend" not in low:
+        if any(k in low for k in (
+            "background worker", "backend service", "daemon service",
+            "queue worker", "webhook processor",
+        )) and not has_positive_web_ui:
             return "backend_service"
-        if any(k in low for k in ("database-driven", "etl pipeline", "data warehouse",
-                                  "sql ledger", "database reporting")) and "frontend" not in low:
+        if any(k in low for k in (
+            "database-driven", "etl pipeline", "data warehouse",
+            "sql ledger", "database reporting",
+        )) and not has_positive_web_ui:
             return "database_app"
         return "web_app"
 
@@ -697,12 +720,16 @@ class TaskPlanner:
                             "INSERT OR IGNORE INTO task_dependencies(task_id,depends_on) VALUES(?,?)",
                             (tid, dep),
                         )
-                # Requeue downstream synthesis/QA/docs if new upstream agents were added or category changed
+                # Requeue downstream synthesis/QA/docs if new upstream agents were added or feedback arrived
+                downstream_gates = {
+                    "qa_tester", "debugger", "code_reviewer",
+                    "devops", "documentation", "release_manager", "chief_orchestrator",
+                }
                 should_requeue = (
                     t["status"] in ("FAILED", "SKIPPED")
                     or (t["status"] == "COMPLETED" and (
-                        category_changed
-                        or any(p in added_agents or p in requeued_agents for p in dag.get(agent_id, []))
+                        any(p in added_agents or p in requeued_agents for p in dag.get(agent_id, []))
+                        or (category_changed and agent_id in downstream_gates)
                         or (bool(execution_feedback) and agent_id in ("debugger", "qa_tester", "release_manager", "chief_orchestrator"))
                     ))
                 )

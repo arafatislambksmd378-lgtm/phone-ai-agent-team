@@ -293,7 +293,7 @@ class Agent(BaseAgent):
             ok=ok,
             summary=f"Tests {verdict} ({test_rel}, {gen.mode})",
             files=["docs/test-report.md", test_rel],
-            data={"verdict": verdict, "test_file": test_rel, "output": output[-800:]},
+            data={"verdict": verdict, "passed": ok, "test_file": test_rel, "output": output[-800:]},
             mode=gen.mode,
             error="" if ok else output[-300:],
         )
@@ -320,7 +320,8 @@ class Agent(BaseAgent):
 
     def _run_pytest(self, test_rel: str) -> tuple[bool, str, str]:
         self._require_tool("run_command")
-        cmd = [sys.executable, "-m", "pytest", "-q", test_rel]
+        target = "tests" if self._exists("tests") else test_rel
+        cmd = [sys.executable, "-m", "pytest", "-q", target]
         try:
             if self.process_manager is not None:
                 res = self.process_manager.run_managed(

@@ -17,6 +17,7 @@ class TaskHandoff:
     summary: str
     files: list[str] = field(default_factory=list)
     verified_files: list[dict[str, str]] = field(default_factory=list)
+    missing_files: list[str] = field(default_factory=list)
     data: dict[str, Any] = field(default_factory=dict)
     mode: str = "deterministic"
     created_at: float = field(default_factory=time.time)
@@ -28,6 +29,7 @@ class TaskHandoff:
             "summary": self.summary,
             "files": self.files,
             "verified_files": self.verified_files,
+            "missing_files": self.missing_files,
             "data": self.data,
             "mode": self.mode,
             "created_at": self.created_at,
@@ -48,6 +50,7 @@ class HandoffManager:
         agent_id = task["agent_id"]
         verified_files: list[dict[str, str]] = []
         valid_rels: list[str] = []
+        missing_rels: list[str] = []
 
         for rel in (result.files or []):
             if fm.exists(rel):
@@ -56,6 +59,8 @@ class HandoffManager:
                     verified_files.append({"path": rel, "sha256": fm.sha256(rel)})
                 except Exception:
                     verified_files.append({"path": rel, "sha256": ""})
+            else:
+                missing_rels.append(rel)
 
         bounded_data = _bound_dict(result.data or {}, max_chars=4000)
         handoff = TaskHandoff(
@@ -64,6 +69,7 @@ class HandoffManager:
             summary=(result.summary or "")[:1000],
             files=valid_rels,
             verified_files=verified_files,
+            missing_files=missing_rels,
             data=bounded_data,
             mode=getattr(result, "mode", "deterministic"),
         )

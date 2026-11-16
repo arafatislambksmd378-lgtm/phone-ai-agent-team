@@ -67,11 +67,20 @@ class Agent(BaseAgent):
         # Step 3 & 4: Locate responsible component & apply minimal safe repair if failing
         if not verdict_pass:
             suspects = self._locate_suspect_files(repro_output)
-            if not suspects and software_type in ("web_app", "rest_api", "backend_service", "database_app"):
-                if not self._exists("backend/app.py"):
-                    unresolved.append("backend/app.py missing — cannot stub an entire backend silently")
-                else:
-                    suspects = ["backend/app.py"]
+            if not suspects:
+                if software_type in ("web_app", "rest_api", "backend_service", "database_app"):
+                    if not self._exists("backend/app.py"):
+                        unresolved.append("backend/app.py missing — cannot stub an entire backend silently")
+                    else:
+                        suspects = ["backend/app.py"]
+                elif software_type == "cli_tool" and self._exists("cli/main.py"):
+                    suspects = ["cli/main.py"]
+                elif software_type == "python_library":
+                    suspects = [f for f in self._list() if f.startswith("src/") and f.endswith("core.py")][:2]
+                elif software_type == "desktop_app" and self._exists("desktop/controller.py"):
+                    suspects = ["desktop/controller.py"]
+                elif software_type == "android_app" and self._exists("domain/model_verifier.py"):
+                    suspects = ["domain/model_verifier.py"]
 
             for target in suspects:
                 if not self._exists(target):

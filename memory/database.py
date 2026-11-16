@@ -320,6 +320,10 @@ class Database:
     def list_tasks(self, project_id: str) -> list[dict]:
         return self.query("SELECT * FROM tasks WHERE project_id=? ORDER BY priority, created_at", (project_id,))
 
+    def task_dependencies(self, task_id: str) -> list[str]:
+        rows = self.query("SELECT depends_on FROM task_dependencies WHERE task_id=?", (task_id,))
+        return [r["depends_on"] for r in rows]
+
     def requeue_failed(self, project_id: str) -> int:
         now = time.time()
         with self._lock:
@@ -423,7 +427,7 @@ class Database:
         from security.secret_manager import redact
         aid = f"appr_{uuid.uuid4().hex[:12]}"
         now = time.time()
-        expires = now + max(1, int(ttl_seconds)) if ttl_seconds and ttl_seconds > 0 else None
+        expires = now + int(ttl_seconds) if (ttl_seconds is not None and int(ttl_seconds) != 0) else None
         clean_detail = redact(str(detail))[:2000]
         self.execute(
             "INSERT INTO approvals(id,project_id,task_id,action,detail,status,requested_at,expires_at) "
