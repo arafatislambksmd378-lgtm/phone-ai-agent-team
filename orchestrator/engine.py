@@ -1,21 +1,29 @@
-"""Orchestrator engine — planner + scheduler + agents + lifecycle, crash-safe."""
+"""Orchestrator engine — dynamic planning, handoffs, approvals, resource guard & crash recovery."""
 from __future__ import annotations
+
 import logging
+import threading
 import time
 from pathlib import Path
 
-from agents.registry import AgentRegistry
+from agents.registry import AGENT_NAMES, AgentRegistry
 from config.settings import Settings
+from execution.document_processor import extract_directory_corpus, extract_document_text
 from execution.file_manager import FileManager
+from execution.packager import package_project_zip
+from execution.resource_manager import ResourceManager
 from execution.sandbox import Sandbox
 from integrations.ai_providers.router import ModelRouter
+from integrations.github.client import GitHubClient
 from memory.database import Database
 from memory.project_memory import ProjectMemory
+from orchestrator.handoff import HandoffManager
 from orchestrator.lifecycle import LifecycleManager
 from orchestrator.planner import TaskPlanner
 from orchestrator.scheduler import Scheduler
-from security.approval import ApprovalManager
-from security.validation import validate_upload, safe_extract_zip
+from security.approval import ApprovalManager, ApprovalRequiredError
+from security.secret_manager import redact
+from security.validation import safe_extract_zip, validate_upload, validate_upload_content
 
 log = logging.getLogger("orchestrator")
 
@@ -29,23 +37,65 @@ class OrchestratorEngine:
         self.db = Database(settings.db_path)
         self.memory = ProjectMemory(self.db)
         self.lifecycle = LifecycleManager(self.db)
-        self.planner = TaskPlanner(self.db)
-        self.approvals = ApprovalManager(self.db)
+        self.resources = ResourceManager(
+            workspace_root=settings.workspace_root,
+            min_free_ram_mb_worker2=getattr(settings, "min_free_ram_mb_worker2", 600),
+            min_free_disk_mb=getattr(settings, "min_free_disk_mb", 250),
+        )
+        self.approvals = ApprovalManager(
+            self.db,
+            default_ttl_seconds=getattr(settings, "approval_ttl_seconds", 3600),
+            notify_callback=self._handle_new_approval,
+        )
         self.router = ModelRouter(settings, db=self.db)
-        self.scheduler = Scheduler(self.db, max_workers=settings.max_concurrent_workers)
+        self.planner = TaskPlanner(self.db, ai_router=self.router)
+        self.handoffs = HandoffManager(self.db)
+        self.github = GitHubClient(
+            repo=getattr(settings, "github_remote_repo", "") or "arafatislambksmd378-lgtm/phone-ai-agent-team",
+            token=getattr(settings, "github_token", ""),
+            approval_manager=self.approvals,
+        )
+        self.scheduler = Scheduler(
+            self.db,
+            max_workers=settings.max_concurrent_workers,
+            resource_manager=self.resources,
+            stale_after=getattr(settings, "stale_task_seconds", 900),
+        )
         self.scheduler.set_worker(self._execute_task)
         self.scheduler.set_idle_callback(self._maybe_finish_projects)
         self._paused = False
         self._cancelled: set[str] = set()
         self._on_progress = None
-        self._finish_lock = __import__("threading").Lock()
+        self._on_approval = None
+        self._on_completion = None
+        self._finish_lock = threading.Lock()
 
     # ---------- hooks ----------
     def set_progress_callback(self, fn) -> None:
         self._on_progress = fn
 
+    def set_approval_callback(self, fn) -> None:
+        """fn(approval_row_dict) — used by TelegramHandler to send inline Approve/Reject buttons."""
+        self._on_approval = fn
+
+    def set_completion_callback(self, fn) -> None:
+        """fn(project_id, report_text, deliverable_zip_path) — delivers final report & ZIP."""
+        self._on_completion = fn
+
+    def _handle_new_approval(self, approval_row: dict) -> None:
+        pid = approval_row.get("project_id", "")
+        self._notify(
+            pid,
+            f"⚠️ Approval required (`{approval_row.get('id')}`) for `{approval_row.get('action')}`: "
+            f"{approval_row.get('detail', '')[:160]}",
+        )
+        if self._on_approval is not None:
+            try:
+                self._on_approval(approval_row)
+            except Exception:
+                log.debug("approval callback failed", exc_info=True)
+
     def _notify(self, project_id: str, msg: str) -> None:
-        from security.secret_manager import redact
         safe = redact(msg)
         log.info("[%s] %s", project_id, safe)
         if self._on_progress:
@@ -54,26 +104,101 @@ class OrchestratorEngine:
             except Exception:
                 log.debug("progress callback failed", exc_info=True)
 
-    # ---------- project intake ----------
-    def create_project(self, name: str, requirements: str = "", quick: bool = False) -> str:
+    # ---------- startup crash / Termux restart recovery ----------
+    def startup_recovery(self) -> dict:
+        """Detect tasks interrupted by a Termux kill/crash, requeue safely, and resume workers."""
+        dangling = self.db.detect_interrupted()
+        if not dangling:
+            return {"interrupted": 0, "projects": []}
+        affected = sorted({t["project_id"] for t in dangling})
+        requeued = self.db.recover_interrupted()
+        for pid in affected:
+            state = self.lifecycle.get(pid)
+            if state in ("EXECUTING", "FAILED", "PAUSED"):
+                self.lifecycle.set(pid, "RECOVERING")
+                self.lifecycle.set(pid, "QUEUED")
+            self._notify(pid, f"♻️ Startup recovery requeued {requeued} interrupted task(s).")
+        if requeued > 0:
+            self.scheduler.start()
+        return {"interrupted": requeued, "projects": affected}
+
+    # ---------- project intake & dynamic planning ----------
+    def create_project(self, name: str, requirements: str = "", quick: bool = False,
+                       *, auto_start: bool = True, dynamic: bool = True) -> str:
         safe_name = "".join(c for c in (name or "project") if c.isalnum() or c in "-_")[:40] or "project"
-        ws = str((self.settings.workspace_root / f"{safe_name}_{int(time.time())}_{len(name or '')}").resolve())
+        ws = str((self.settings.workspace_root / f"{safe_name}_{int(time.time() * 1000)}").resolve())
         Path(ws).mkdir(parents=True, exist_ok=True)
         pid = self.db.create_project(safe_name, ws, {"requirements_preview": (requirements or "")[:500]})
         self.lifecycle.set(pid, "INPUT_RECEIVED")
         self._notify(pid, f"Project created: {safe_name}")
         FileManager(ws).write("requirements.txt", requirements or f"Project: {name}")
-        Sandbox(ws).init_git()
-        self.lifecycle.set(pid, "VALIDATING")
-        self.lifecycle.set(pid, "PLANNING")
-        task_ids = self.planner.plan(pid, requirements, quick=quick)
-        self.lifecycle.set(pid, "QUEUED")
-        self._notify(pid, f"Planned {len(task_ids)} tasks. Starting workers…")
-        self.scheduler.start()
+        sb = Sandbox(ws)
+        sb.init_git()
+        sha = sb.checkpoint_commit("initial blueprint")
+        if sha:
+            self.db.record_checkpoint(pid, "initial blueprint", sha)
+
+        if auto_start:
+            self.start_project(pid, requirements=requirements, quick=quick, dynamic=dynamic)
         return pid
 
-    def ingest_upload(self, project_id: str, local_path: str, original_name: str) -> tuple[bool, str]:
-        """Validate + stage an uploaded blueprint into the project workspace."""
+    def start_project(self, project_id: str, requirements: str | None = None,
+                      quick: bool = False, *, dynamic: bool = True) -> list[str]:
+        """Validate blueprint, dynamically plan the Task DAG, and launch on-demand worker(s)."""
+        proj = self.db.get_project(project_id)
+        if not proj:
+            raise ValueError(f"Unknown project: {project_id}")
+        fm = FileManager(proj["workspace"])
+        req_text = requirements if requirements is not None else (
+            fm.read("requirements.txt") if fm.exists("requirements.txt") else ""
+        )
+        self.lifecycle.set(project_id, "VALIDATING")
+        self.lifecycle.set(project_id, "PLANNING")
+        task_ids = self.planner.plan(project_id, req_text, quick=quick, dynamic=dynamic)
+        analysis = self.db.get_memory(project_id).get("blueprint_analysis") or {}
+        stype = analysis.get("software_type", "web_app")
+        excluded = list((analysis.get("excluded_agents") or {}).keys())
+        self.lifecycle.set(project_id, "QUEUED")
+        excl_note = f" (excluded {len(excluded)} irrelevant agents)" if excluded else ""
+        self._notify(
+            project_id,
+            f"Planned {len(task_ids)} tasks for `{stype}`{excl_note}. Starting worker pool…",
+        )
+        self.scheduler.start()
+        return task_ids
+
+    def replan_project(self, project_id: str, additional_requirements: str = "",
+                       execution_feedback: str = "") -> dict:
+        """Update requirements and dynamically replan the project's Task DAG."""
+        proj = self.db.get_project(project_id)
+        if not proj:
+            return {"ok": False, "error": "Project not found"}
+        if additional_requirements:
+            self._append_requirements(project_id, additional_requirements)
+        fm = FileManager(proj["workspace"])
+        full_req = fm.read("requirements.txt") if fm.exists("requirements.txt") else additional_requirements
+
+        if not self.db.list_tasks(project_id):
+            tids = self.start_project(project_id, requirements=full_req)
+            return {"ok": True, "started": True, "task_count": len(tids)}
+
+        info = self.planner.replan(project_id, full_req, execution_feedback=execution_feedback)
+        state = self.lifecycle.get(project_id)
+        if state in ("FAILED", "PAUSED"):
+            self.lifecycle.set(project_id, "RECOVERING")
+            self.lifecycle.set(project_id, "QUEUED")
+        if info["added_agents"] or info["requeued_agents"]:
+            self.scheduler.start()
+            self._notify(
+                project_id,
+                f"🔄 Replanned `{info['software_type']}`: "
+                f"+{len(info['added_agents'])} added, {len(info['requeued_agents'])} requeued.",
+            )
+        return {"ok": True, **info}
+
+    def ingest_upload(self, project_id: str, local_path: str, original_name: str,
+                      *, auto_plan_if_waiting: bool = False) -> tuple[bool, str]:
+        """Validate, safely extract text/ZIP, and stage an uploaded blueprint into the workspace."""
         proj = self.db.get_project(project_id)
         if not proj:
             return False, "Project not found"
@@ -81,24 +206,46 @@ class OrchestratorEngine:
         ok, msg = validate_upload(original_name, size, self.settings.max_upload_mb)
         if not ok:
             return False, msg
-        from security.validation import validate_upload_content
         ok, msg = validate_upload_content(original_name, local_path)
         if not ok:
             return False, msg
+
         ws = Path(proj["workspace"])
         if original_name.lower().endswith(".zip"):
             ok, msg, files = safe_extract_zip(
-                local_path, str(ws / "extracted"),
-                self.settings.max_zip_files, self.settings.max_zip_mb)
+                local_path,
+                str(ws / "extracted"),
+                max_files=self.settings.max_zip_files,
+                max_total_mb=self.settings.max_zip_mb,
+                max_archive_mb=self.settings.max_upload_mb,
+            )
             if ok:
-                self._append_requirements(project_id, f"Blueprint archive: {original_name} ({len(files)} files)")
+                extracted_text = extract_directory_corpus(ws / "extracted", max_files=20, max_chars=60_000)
+                header = f"\n--- Blueprint archive: {original_name} ({len(files)} files) ---\n"
+                self._append_requirements(project_id, header + extracted_text)
+                if auto_plan_if_waiting and self.lifecycle.get(project_id) == "INPUT_RECEIVED" and not self.db.list_tasks(project_id):
+                    self.start_project(project_id)
             return ok, msg
+
         dest = ws / "uploads" / Path(original_name).name
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_bytes(Path(local_path).read_bytes())
-        text = dest.read_bytes()[:200_000].decode("utf-8", errors="ignore")
-        self._append_requirements(project_id, text)
-        return True, f"Received {original_name} ({size} bytes)"
+        try:
+            dest.chmod(0o600)
+        except OSError:
+            pass
+
+        doc = extract_document_text(dest, original_name, max_chars=80_000)
+        if not doc.get("ok"):
+            return False, doc.get("warning") or "Could not extract document text"
+        extracted_text = doc.get("text") or ""
+        self._append_requirements(
+            project_id,
+            f"\n--- Uploaded {original_name} ({doc['kind']}) ---\n{extracted_text}",
+        )
+        if auto_plan_if_waiting and self.lifecycle.get(project_id) == "INPUT_RECEIVED" and not self.db.list_tasks(project_id):
+            self.start_project(project_id)
+        return True, f"Received {original_name} ({size} bytes, {doc['chars']} chars extracted)"
 
     def _append_requirements(self, project_id: str, text: str) -> None:
         proj = self.db.get_project(project_id)
@@ -108,7 +255,7 @@ class OrchestratorEngine:
         existing = fm.read("requirements.txt") if fm.exists("requirements.txt") else ""
         fm.write("requirements.txt", (existing + "\n" + (text or ""))[:400_000])
 
-    # ---------- execution ----------
+    # ---------- task execution ----------
     def _execute_task(self, task: dict) -> None:
         pid, tid, agent_id = task["project_id"], task["id"], task["agent_id"]
         if pid in self._cancelled:
@@ -120,37 +267,125 @@ class OrchestratorEngine:
             if pid in self._cancelled:
                 self.db.set_task_status(tid, "CANCELLED", error="Project cancelled")
                 return
+
         proj = self.db.get_project(pid)
         if not proj:
             self.db.set_task_status(tid, "FAILED", error="Project not found")
             return
+
+        # 1. Android Resource Manager admission check
+        res_ok, res_msg, _ = self.resources.check_resources_for_task()
+        if not res_ok:
+            self.db.set_task_status(tid, "FAILED", error=res_msg)
+            self._notify(pid, f"⚠️ Resource guard paused `{agent_id}`: {res_msg}")
+            self._maybe_finish_project(pid)
+            return
+
+        # 2. Paid AI usage threshold approval gate
+        cost_cap = float(getattr(self.settings, "paid_cost_approval_usd", 0.0) or 0.0)
+        if cost_cap > 0 and self.router.mode() == "live":
+            spent = self.db.total_cost_usd(pid)
+            if spent >= cost_cap and not self._has_approved_action(pid, "paid_api_usage"):
+                aid = self.approvals.request(
+                    pid,
+                    "paid_api_usage",
+                    f"AI spend (${spent:.4f}) reached threshold (${cost_cap:.2f})",
+                    task_id=tid,
+                )
+                self.db.set_task_status(tid, "QUEUED", error=f"Waiting for paid_api_usage approval {aid}")
+                self.lifecycle.set(pid, "WAITING_FOR_APPROVAL")
+                return
+
+        # 3. Validate upstream dependencies & build rich Agent-to-Agent handoff payload
+        deps_ok, unmet = self.handoffs.validate_dependencies(tid)
+        if not deps_ok:
+            self.db.set_task_status(tid, "QUEUED", error=f"Waiting on dependencies: {unmet}")
+            return
+
+        enriched_payload = self.handoffs.prepare_task_input(pid, task)
         ws = proj["workspace"]
-        fm = FileManager(ws)
-        registry = AgentRegistry(workspace=ws, ai_router=self.router, db=self.db, file_manager=fm)
+        fm = FileManager(ws, approval_manager=self.approvals, project_id=pid)
+        registry = AgentRegistry(
+            workspace=ws,
+            ai_router=self.router,
+            db=self.db,
+            file_manager=fm,
+            approval_manager=self.approvals,
+            process_manager=self.resources.processes,
+        )
+
         eid = self.db.start_execution(pid, tid, agent_id)
-        if self.lifecycle.get(pid) in ("QUEUED", "RECOVERING"):
+        self.db.update_agent_status(agent_id, AGENT_NAMES.get(agent_id, agent_id), "RUNNING")
+        if self.lifecycle.get(pid) in ("QUEUED", "RECOVERING", "WAITING_FOR_APPROVAL"):
             self.lifecycle.set(pid, "EXECUTING")
+        if agent_id in ("qa_tester", "debugger") and self.lifecycle.get(pid) == "EXECUTING":
+            self.lifecycle.set(pid, "TESTING")
+        elif agent_id in ("code_reviewer", "release_manager") and self.lifecycle.get(pid) in ("EXECUTING", "TESTING"):
+            self.lifecycle.set(pid, "REVIEWING")
+
         self._notify(pid, f"▶ {agent_id}: {task['title']}")
+        task_for_agent = dict(task)
+        task_for_agent["payload"] = enriched_payload
+        task_for_agent["execution_id"] = eid
+
         started = time.time()
+        err = ""
+        result = None
         try:
-            result = registry.run(agent_id, task)
-        except Exception as e:  # agent crash must never orphan the task
+            result = registry.run(agent_id, task_for_agent)
+        except ApprovalRequiredError as ae:
+            err = str(ae)
+            self.db.finish_execution(eid, "WAITING_FOR_APPROVAL", error=err)
+            self.db.set_task_status(tid, "QUEUED", error=err)
+            self.db.update_agent_status(agent_id, AGENT_NAMES.get(agent_id, agent_id), "IDLE")
+            if self.lifecycle.get(pid) in ("TESTING", "REVIEWING"):
+                self.lifecycle.set(pid, "EXECUTING")
+            self.lifecycle.set(pid, "WAITING_FOR_APPROVAL")
+            self._notify(pid, f"⏸ `{agent_id}` paused awaiting approval `{ae.approval_id}`.")
+            return
+        except Exception as e:
             log.exception("agent %s crashed", agent_id)
-            result = None
             err = f"{type(e).__name__}: {e}"
-        else:
-            err = ""
-        elapsed_ms = int((time.time() - started) * 1000)
+        finally:
+            self.resources.post_task_housekeeping(ws)
+
+        elapsed_s = time.time() - started
+        elapsed_ms = int(elapsed_s * 1000)
+
+        # Enforce configured task timeout ceiling honestly
+        if elapsed_s > max(1, int(self.settings.task_timeout_seconds)):
+            result = None
+            err = f"Task exceeded timeout ({int(elapsed_s)}s > {self.settings.task_timeout_seconds}s)"
+
+        # Handle structured approval pause returned via AgentResult.data
+        if result is not None and not result.ok and (result.data or {}).get("needs_approval"):
+            aid = (result.data or {}).get("approval_id", "")
+            self.db.finish_execution(eid, "WAITING_FOR_APPROVAL", error=result.error or result.summary)
+            self.db.set_task_status(tid, "QUEUED", error=f"Waiting for approval {aid}")
+            self.db.update_agent_status(agent_id, AGENT_NAMES.get(agent_id, agent_id), "IDLE")
+            if self.lifecycle.get(pid) in ("TESTING", "REVIEWING"):
+                self.lifecycle.set(pid, "EXECUTING")
+            self.lifecycle.set(pid, "WAITING_FOR_APPROVAL")
+            return
 
         if result is not None and result.ok:
-            self.db.set_task_status(tid, "COMPLETED", result=result.summary)
+            handoff = self.handoffs.verify_and_record(pid, task, result, fm)
+            self.db.set_task_status(
+                tid,
+                "COMPLETED",
+                result=result.summary,
+                output_data=handoff.to_dict(),
+            )
             self.db.finish_execution(eid, "COMPLETED")
+            self.db.update_agent_status(agent_id, AGENT_NAMES.get(agent_id, agent_id), "IDLE")
             self.db.log(eid, "INFO", f"{agent_id} ok in {elapsed_ms}ms: {result.summary}")
             self._notify(pid, f"✓ {agent_id}: {result.summary}")
-            Sandbox(ws).checkpoint(f"{agent_id}: {task['title']}")
-            for rel in result.files:
+            sha = Sandbox(ws).checkpoint_commit(f"{agent_id}: {task['title']}")
+            if sha:
+                self.db.record_checkpoint(pid, f"{agent_id}: {task['title']}", sha)
+            for vf in handoff.verified_files:
                 try:
-                    self.db.add_artifact(pid, "file", rel, fm.sha256(rel))
+                    self.db.add_artifact(pid, "file", vf["path"], vf["sha256"])
                 except Exception:
                     pass
         else:
@@ -158,29 +393,79 @@ class OrchestratorEngine:
             n = self.db.increment_retry(tid)
             max_retries = int(task.get("max_retries") or 3)
             self.db.finish_execution(eid, "FAILED", error=reason)
+            self.db.update_agent_status(agent_id, AGENT_NAMES.get(agent_id, agent_id), "IDLE")
             self.db.log(eid, "ERROR", f"{agent_id} failed: {reason}")
             if n < max_retries:
                 self.db.set_task_status(tid, "QUEUED", error=reason)
                 self._notify(pid, f"↻ {agent_id} retry {n}/{max_retries}: {reason[:200]}")
             else:
                 self.db.set_task_status(tid, "FAILED", error=reason)
-                self._notify(pid, f"✗ {agent_id} failed: {reason[:300]}")
+                skipped = self.handoffs.propagate_failure(pid)
+                extra = f" ({skipped} dependent task(s) skipped)" if skipped else ""
+                self._notify(pid, f"✗ {agent_id} failed: {reason[:260]}{extra}")
+
         self._maybe_finish_project(pid)
 
+    def _has_approved_action(self, project_id: str, action: str) -> bool:
+        rows = self.db.query(
+            "SELECT id FROM approvals WHERE project_id=? AND action=? AND status='APPROVED'",
+            (project_id, action),
+        )
+        return any(self.approvals.is_approved(r["id"]) for r in rows)
+
+    def on_approval_decided(self, approval_id: str, approved: bool) -> None:
+        """Resume or fail waiting tasks when a human decides a pending approval."""
+        row = self.db.get_approval(approval_id)
+        if not row:
+            return
+        pid = row["project_id"]
+        tid = row.get("task_id")
+        if approved:
+            if tid:
+                t = self.db.get_task(tid)
+                if t:
+                    payload = self.handoffs.prepare_task_input(pid, t)
+                    payload["approval_id"] = approval_id
+                    payload["approved"] = True
+                    self.db.update_task_payload(tid, payload)
+            if self.lifecycle.get(pid) == "WAITING_FOR_APPROVAL":
+                self.lifecycle.set(pid, "QUEUED")
+            self.scheduler.start()
+        else:
+            if tid:
+                self.db.set_task_status(tid, "FAILED", error=f"Approval {approval_id} rejected by user")
+                self.handoffs.propagate_failure(pid)
+            if self.lifecycle.get(pid) == "WAITING_FOR_APPROVAL":
+                self.lifecycle.set(pid, "EXECUTING")
+            self._maybe_finish_project(pid)
+
+    # ---------- project completion ----------
     def _maybe_finish_projects(self) -> None:
         """When the pool is idle, close out any project whose tasks are all final."""
         if self.scheduler.active_count() > 0:
             return
-        for proj in self.db.query("SELECT id FROM projects WHERE status IN "
-                                  "('QUEUED','EXECUTING','RECOVERING','TESTING','REVIEWING')"):
+        for proj in self.db.query(
+            "SELECT id FROM projects WHERE lifecycle IN ('QUEUED','EXECUTING','RECOVERING','TESTING','REVIEWING')"
+        ):
             self._maybe_finish_project(proj["id"])
 
     def _maybe_finish_project(self, pid: str) -> bool:
         if pid in self._cancelled:
             return False
         tasks = self.db.list_tasks(pid)
-        if not tasks or not all(t["status"] in FINAL_TASK_STATES for t in tasks):
+        if not tasks:
             return False
+        if not all(t["status"] in FINAL_TASK_STATES for t in tasks):
+            # Ensure permanent upstream failures propagate even if set externally
+            if any(t["status"] == "FAILED" for t in tasks):
+                self.handoffs.propagate_failure(pid)
+                tasks = self.db.list_tasks(pid)
+            if not all(t["status"] in FINAL_TASK_STATES for t in tasks):
+                return False
+
+        delivered_zip = ""
+        completed_now = False
+
         with self._finish_lock:
             state = self.lifecycle.get(pid)
             if state in ("COMPLETED", "CANCELLED"):
@@ -188,47 +473,87 @@ class OrchestratorEngine:
             failed = [t for t in tasks if t["status"] == "FAILED"]
             pending_approvals = self.db.pending_approvals(pid)
             if pending_approvals:
-                if state == "QUEUED":
+                if state in ("QUEUED", "TESTING", "REVIEWING"):
                     self.lifecycle.set(pid, "EXECUTING")
                 self.lifecycle.set(pid, "WAITING_FOR_APPROVAL")
                 self._notify(pid, f"⏸ {len(pending_approvals)} approval(s) pending.")
                 return False
             if failed:
-                if state == "QUEUED":
+                if state in ("QUEUED", "TESTING", "REVIEWING"):
                     self.lifecycle.set(pid, "EXECUTING")
                 if self.lifecycle.set(pid, "FAILED"):
                     self._notify(pid, f"Project FAILED ({len(failed)} task(s)). Use /recover to retry.")
             else:
-                # Walk the legal path to COMPLETED so the state machine stays honest.
                 for intermediate in ("EXECUTING", "TESTING", "REVIEWING"):
                     if self.lifecycle.get(pid) == intermediate:
                         continue
                     self.lifecycle.set(pid, intermediate)
                 if self.lifecycle.set(pid, "COMPLETED"):
+                    completed_now = True
+                    proj = self.db.get_project(pid)
+                    if proj:
+                        pkg = package_project_zip(proj["workspace"])
+                        if pkg.get("ok"):
+                            delivered_zip = pkg["zip_path"]
+                            self.db.add_artifact(pid, "deliverable_zip", delivered_zip, pkg["sha256"])
                     self._notify(pid, "🎉 Project COMPLETED. Workers stopped; Telegram listener stays up.")
-            if not self.db.query("SELECT id FROM projects WHERE status IN "
-                                 "('QUEUED','EXECUTING','RECOVERING','TESTING','REVIEWING')"):
+
+            if not self.db.query(
+                "SELECT id FROM projects WHERE lifecycle IN ('QUEUED','EXECUTING','RECOVERING','TESTING','REVIEWING')"
+            ):
                 self.scheduler.stop()
+
+        if completed_now and self._on_completion is not None:
+            try:
+                self._on_completion(pid, self.report(pid), delivered_zip)
+            except Exception:
+                log.debug("completion callback failed", exc_info=True)
         return True
 
-    # ---------- control ----------
+    # ---------- control & reporting ----------
     def status(self, project_id: str) -> dict:
         proj = self.db.get_project(project_id)
         tasks = self.db.list_tasks(project_id) if proj else []
+        mem = self.db.get_memory(project_id) if proj else {}
         return {
             "project": proj,
             "lifecycle": self.lifecycle.get(project_id) if proj else "UNKNOWN",
-            "tasks": [{"id": t["id"], "agent": t["agent_id"], "title": t["title"],
-                       "status": t["status"], "error": t["error"], "retries": t["retries"]}
-                      for t in tasks],
+            "blueprint_analysis": mem.get("blueprint_analysis") or {},
+            "tasks": [
+                {
+                    "id": t["id"],
+                    "agent": t["agent_id"],
+                    "title": t["title"],
+                    "status": t["status"],
+                    "summary": t.get("result") or "",
+                    "error": t["error"],
+                    "retries": t["retries"],
+                }
+                for t in tasks
+            ],
             "pending_approvals": self.db.pending_approvals(project_id) if proj else [],
         }
+
+    def agent_statuses(self) -> list[dict]:
+        db_rows = {r["id"]: r for r in self.db.query("SELECT * FROM agents")}
+        out = []
+        for aid, name in AGENT_NAMES.items():
+            row = db_rows.get(aid) or {}
+            out.append({
+                "id": aid,
+                "name": name,
+                "status": row.get("status", "IDLE"),
+                "last_run_at": row.get("last_run_at"),
+            })
+        return out
 
     def pause(self) -> None:
         self._paused = True
 
     def resume(self) -> None:
         self._paused = False
+        if self.db.query("SELECT id FROM tasks WHERE status='QUEUED' LIMIT 1"):
+            self.scheduler.start()
 
     def cancel(self, project_id: str) -> None:
         self._cancelled.add(project_id)
@@ -242,16 +567,34 @@ class OrchestratorEngine:
         proj = self.db.get_project(project_id)
         if not proj:
             return {"ok": False, "error": "Project not found"}
+        self._cancelled.discard(project_id)
         interrupted = self.db.recover_interrupted()
         requeued = self.db.requeue_failed(project_id)
-        if self.lifecycle.get(project_id) in ("FAILED", "PAUSED"):
+        cur_state = self.lifecycle.get(project_id)
+        if cur_state in ("FAILED", "PAUSED", "EXECUTING"):
             self.lifecycle.set(project_id, "RECOVERING")
             self.lifecycle.set(project_id, "QUEUED")
-        elif self.lifecycle.get(project_id) == "RECOVERING":
+        elif cur_state == "RECOVERING":
             self.lifecycle.set(project_id, "QUEUED")
         self.scheduler.start()
         self._notify(project_id, f"♻️ Recovered: {interrupted} interrupted, {requeued} failed requeued.")
         return {"ok": True, "interrupted": interrupted, "requeued": requeued}
+
+    def deliverable_zip_path(self, project_id: str) -> str:
+        proj = self.db.get_project(project_id)
+        if not proj:
+            return ""
+        arts = self.db.query(
+            "SELECT path FROM artifacts WHERE project_id=? AND kind='deliverable_zip' ORDER BY created_at DESC LIMIT 1",
+            (project_id,),
+        )
+        if arts and Path(arts[0]["path"]).is_file():
+            return arts[0]["path"]
+        pkg = package_project_zip(proj["workspace"])
+        if pkg.get("ok"):
+            self.db.add_artifact(project_id, "deliverable_zip", pkg["zip_path"], pkg["sha256"])
+            return pkg["zip_path"]
+        return ""
 
     def report(self, project_id: str) -> str:
         st = self.status(project_id)
@@ -260,22 +603,30 @@ class OrchestratorEngine:
             return "Project not found."
         done = [t for t in st["tasks"] if t["status"] == "COMPLETED"]
         failed = [t for t in st["tasks"] if t["status"] == "FAILED"]
+        skipped = [t for t in st["tasks"] if t["status"] == "SKIPPED"]
+        analysis = st.get("blueprint_analysis") or {}
+        stype = analysis.get("software_type", "web_app")
+        excluded = list((analysis.get("excluded_agents") or {}).keys())
         lines = [
             f"📊 Report — {proj['name']} ({project_id})",
-            f"State: {st['lifecycle']}",
-            f"Tasks: {len(done)}/{len(st['tasks'])} completed, {len(failed)} failed",
+            f"State: {st['lifecycle']} | Category: {stype}",
+            f"Tasks: {len(done)}/{len(st['tasks'])} completed, {len(failed)} failed, {len(skipped)} skipped",
             f"Workspace: {proj['workspace']}",
         ]
+        if excluded:
+            lines.append("Excluded agents: " + ", ".join(excluded))
         if failed:
-            lines.append("Failed: " + ", ".join(f"{t['agent']}({t['error'][:60]})" for t in failed))
+            lines.append("Failed: " + ", ".join(f"{t['agent']}({(t['error'] or '')[:60]})" for t in failed))
         if st["pending_approvals"]:
             lines.append(f"Approvals pending: {len(st['pending_approvals'])}")
         usage = self.db.usage_summary()
         if usage:
             lines.append("AI usage: " + ", ".join(
-                f"{u['provider']}/{u['model']} x{u['runs']} (${u['cost'] or 0:.4f})" for u in usage[:3]))
+                f"{u['provider']}/{u['model']} x{u['runs']} (${u['cost'] or 0:.4f})" for u in usage[:3]
+            ))
         return "\n".join(lines)
 
     def shutdown(self) -> None:
         self.scheduler.stop()
+        self.resources.shutdown()
         self.db.close()

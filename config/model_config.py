@@ -10,6 +10,13 @@ DEFAULT_MODELS: dict[str, str] = {k: "gemini-2.0-flash" for k in (
     "documentation", "release_manager", "workspace_executor",
 )}
 
+PROVIDER_FAMILIES: dict[str, str | tuple[str, ...]] = {
+    "gemini": "gemini",
+    "openai": ("gpt", "o1", "o3", "o4", "codex"),
+    "codex": ("gpt", "o1", "o3", "o4", "codex"),
+    "anthropic": "claude",
+}
+
 
 def _env_overrides() -> dict[str, str]:
     """Per-agent overrides via MODEL_<AGENT_ID> environment variables."""
@@ -31,6 +38,7 @@ class ModelConfig:
     provider_models: dict[str, str] = field(default_factory=lambda: {
         "gemini": os.getenv("AI_MODEL_GEMINI", os.getenv("AI_MODEL_DEFAULT", "gemini-2.0-flash")),
         "openai": os.getenv("AI_MODEL_OPENAI", "gpt-4o-mini"),
+        "codex": os.getenv("AI_MODEL_CODEX", "gpt-4o"),
         "anthropic": os.getenv("AI_MODEL_ANTHROPIC", "claude-3-5-haiku-latest"),
     })
 
@@ -39,9 +47,11 @@ class ModelConfig:
         agent_model = self.agent_models.get(agent_id) or self.default_model
         if provider is None:
             return agent_model
-        family = {"gemini": "gemini", "openai": ("gpt", "o1", "o3"), "anthropic": "claude"}[provider]
+        family = PROVIDER_FAMILIES.get(provider)
         if isinstance(family, str) and agent_model.startswith(family):
             return agent_model
         if isinstance(family, tuple) and agent_model.startswith(family):
             return agent_model
+        if provider not in PROVIDER_FAMILIES:
+            return self.provider_models.get(provider) or agent_model
         return self.provider_models.get(provider, agent_model)
