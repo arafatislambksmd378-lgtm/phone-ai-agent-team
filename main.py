@@ -1,6 +1,7 @@
 """Phone AI Agent Team — entry point.
 
   python3 main.py                # Telegram bot + on-demand worker pool
+  python3 main.py --web          # Web API Key & Live Verification Portal (0.0.0.0:8080)
   python3 main.py --demo         # run a local pipeline, no Telegram needed
   python3 main.py --status       # list projects from the database
   python3 main.py --health       # provider, database & Android resource status
@@ -162,6 +163,10 @@ def _remove_pid() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Phone AI Agent Team")
+    ap.add_argument("--web", action="store_true", help="launch API Key & Live Verification web page")
+    ap.add_argument("--host", default="0.0.0.0", help="with --web: bind host (default 0.0.0.0)")
+    ap.add_argument("--port", type=int, default=int(os.getenv("WEB_SETUP_PORT", "8080")),
+                    help="with --web: bind port (default 8080)")
     ap.add_argument("--demo", action="store_true", help="run a local pipeline without Telegram")
     ap.add_argument("--quick", action="store_true", help="with --demo: 5-step short pipeline")
     ap.add_argument("--blueprint", default="", help="with --demo: custom blueprint specification text")
@@ -174,6 +179,26 @@ def main(argv: list[str] | None = None) -> int:
     settings = get_settings()
     settings.ensure_dirs()
     setup_logging(settings)
+
+    if args.web:
+        from integrations.web.setup_server import create_setup_http_server
+        srv = create_setup_http_server(host=args.host, port=args.port)
+        log.info("API Key & Live Verification Portal listening on http://%s:%d", args.host, args.port)
+
+        def _web_shutdown(signum, frame):
+            log.info("signal %s — stopping web portal", signum)
+            threading.Thread(target=srv.shutdown, daemon=True).start()
+
+        import threading
+        signal.signal(signal.SIGINT, _web_shutdown)
+        signal.signal(signal.SIGTERM, _web_shutdown)
+        try:
+            srv.serve_forever()
+        finally:
+            srv.controller.shutdown()  # type: ignore[attr-defined]
+            srv.server_close()
+        return 0
+
     engine = OrchestratorEngine(settings)
 
     try:

@@ -31,11 +31,14 @@ nano .env
 python3 main.py --demo --quick
 python3 main.py --demo --blueprint "Build a Python CLI tool to Bookmark URLs with SQLite search"
 
-# 4. Start the Telegram listener (foreground or background daemon)
+# 4. Open the Web API Key & Live Verification Portal (paste LLM & Telegram keys in browser)
+./scripts/start_web_setup.sh
+
+# 5. Start the Telegram listener directly (foreground or background daemon)
 ./scripts/start_termux.sh
 ./scripts/start_termux.sh --daemon
 
-# 5. Check health or stop cleanly
+# 6. Check health or stop cleanly
 ./scripts/healthcheck.sh
 ./scripts/stop_termux.sh
 ```
