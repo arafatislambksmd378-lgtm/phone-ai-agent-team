@@ -4,7 +4,7 @@ from __future__ import annotations
 from agents.base import AgentResult, BaseAgent
 from agents.helpers import title_from
 
-SYSTEM = """You are a mobile-first UI/UX designer. Produce a Markdown design spec:
+SYSTEM = """You are a UI/UX designer. Produce a Markdown design spec:
 design tokens, screen inventory, navigation model, component states (loading/empty/
 error/offline) and accessibility notes. Assume a small phone screen, one hand, and a
 slow connection. No images, no external design tools."""
