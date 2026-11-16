@@ -1,17 +1,30 @@
 [project]
 name = "phone-ai-agent-team"
-version = "1.0.0"
-description = "On-demand 16-agent AI software development automation for Android Termux"
+version = "2.0.0"
+description = "16-agent AI software development automation for Android Termux"
+readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["python-telegram-bot>=21.0,<23.0", "requests>=2.31"]
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0,<10.0"]
+
+[project.scripts]
+phone-agent-team = "main:main"
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
+[tool.setuptools]
+py-modules = ["main"]
 
 [tool.setuptools.packages.find]
 include = ["config*", "orchestrator*", "agents*", "integrations*", "execution*", "memory*", "security*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"
+filterwarnings = ["error::DeprecationWarning:agents.*"]

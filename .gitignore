@@ -1,15 +1,28 @@
-.env
+# Python
 __pycache__/
-*.pyc
-.venv/
-venv/
-data/
-logs/*.log
-projects/*
-!projects/.gitkeep
-backups/*.db
-backups/*.zip
+*.py[cod]
 *.egg-info/
 .pytest_cache/
-dist/
-build/
+.venv/
+venv/
+
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Runtime state
+data/
+logs/*.log*
+projects/
+backups/*
+!backups/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+*.part
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/

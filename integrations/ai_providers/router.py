@@ -1,60 +1,108 @@
-"""AI Model Router — provider fallback, capability checks, usage tracking, mock mode."""
+"""AI Model Router — per-provider models, explicit fallback, usage tracking, honest mock mode.
+
+Modes reported on every result:
+  "live"   — a real provider answered
+  "mock"   — no provider configured; deterministic local output (NOT AI)
+  "failed" — providers were configured but every attempt failed
+"""
 from __future__ import annotations
-import time
-from config.model_config import ModelConfig, AGENT_CAPABILITIES
+import logging
+
+from config.model_config import ModelConfig
+from integrations.ai_providers.anthropic import AnthropicAdapter
 from integrations.ai_providers.gemini import GeminiAdapter
 from integrations.ai_providers.openai import OpenAIAdapter
-from integrations.ai_providers.anthropic import AnthropicAdapter
 
-# Rough USD per 1M tokens (for cost tracking where supported)
-COST_PER_M = {"gemini": (0.15, 0.60), "openai": (0.15, 0.60), "anthropic": (0.80, 4.0)}
+log = logging.getLogger("ai_router")
+
+# Rough USD per 1M tokens (prompt, completion) — for usage estimates only.
+COST_PER_M = {"gemini": (0.10, 0.40), "openai": (0.15, 0.60), "anthropic": (0.80, 4.00)}
+
 
 class ModelRouter:
     def __init__(self, settings, model_config: ModelConfig | None = None, db=None):
         self.settings = settings
-        self.cfg = model_config or ModelConfig(provider_order=settings.ai_provider_order, default_model=settings.ai_model_default)
+        timeout = getattr(settings, "ai_timeout_seconds", 60)
+        self.cfg = model_config or ModelConfig(
+            provider_order=list(settings.ai_provider_order),
+            default_model=settings.ai_model_default,
+            provider_models={
+                "gemini": getattr(settings, "ai_model_gemini", settings.ai_model_default),
+                "openai": getattr(settings, "ai_model_openai", "gpt-4o-mini"),
+                "anthropic": getattr(settings, "ai_model_anthropic", "claude-3-5-haiku-latest"),
+            },
+        )
+        self.allow_fallback = bool(getattr(settings, "allow_provider_fallback", True))
         self.db = db
         self.adapters = {
-            "gemini": GeminiAdapter(settings.gemini_api_key, self.cfg.default_model),
-            "openai": OpenAIAdapter(settings.openai_api_key, self.cfg.default_model, settings.openai_base_url),
-            "anthropic": AnthropicAdapter(settings.anthropic_api_key, self.cfg.default_model),
+            "gemini": GeminiAdapter(settings.gemini_api_key,
+                                    self.cfg.provider_models.get("gemini", ""), timeout),
+            "openai": OpenAIAdapter(settings.openai_api_key,
+                                    self.cfg.provider_models.get("openai", ""),
+                                    settings.openai_base_url, timeout),
+            "anthropic": AnthropicAdapter(settings.anthropic_api_key,
+                                          self.cfg.provider_models.get("anthropic", ""), timeout),
         }
 
-    def _capable(self, adapter, agent_id: str) -> bool:
-        caps = AGENT_CAPABILITIES.get(agent_id, {})
-        if caps.get("needs_tools") and not adapter.supports_tools:
-            return False
-        return True
+    # ---- state ----
+    def configured_providers(self) -> list[str]:
+        return [p for p in self.cfg.provider_order if p in self.adapters and self.adapters[p].available()]
 
-    def complete(self, agent_id: str, system: str, user: str) -> dict:
-        model = self.cfg.model_for(agent_id)
-        tried = []
-        for pname in self.cfg.provider_order:
-            ad = self.adapters.get(pname)
-            if ad is None or not ad.available():
-                continue
-            if not self._capable(ad, agent_id):
-                tried.append(f"{pname}:capability")
-                continue
-            ad.model = model if pname == "gemini" else ad.model  # keep provider default unless gemini
-            if pname == "gemini":
-                ad.model = model
-            r = ad.complete(system, user)
-            if r.get("ok"):
-                if self.db is not None:
-                    pt, ct = r.get("prompt_tokens", 0), r.get("completion_tokens", 0)
-                    rate = COST_PER_M.get(pname, (0, 0))
-                    cost = (pt * rate[0] + ct * rate[1]) / 1_000_000
-                    try:
-                        self.db.record_usage(pname, r.get("model", model), agent_id, pt, ct, cost)
-                    except Exception:
-                        pass
-                return r
-            tried.append(f"{pname}:{r.get('error','')[:80]}")
-        # Mock mode: deterministic fallback so system works offline / without keys
-        if not any(a.available() for a in self.adapters.values()):
-            return {"ok": True, "text": f"[MOCK {agent_id}] {user[:200]}", "provider": "mock", "model": model, "mock": True}
-        return {"ok": False, "error": f"All providers failed: {'; '.join(tried)}", "tried": tried}
+    def mode(self) -> str:
+        return "live" if self.configured_providers() else "mock"
 
     def health(self) -> dict:
-        return {k: {"available": v.available(), "model": v.model} for k, v in self.adapters.items()}
+        return {
+            "mode": self.mode(),
+            "fallback_enabled": self.allow_fallback,
+            "providers": {name: {"status": ad.status(), "model": ad.model}
+                          for name, ad in self.adapters.items()},
+        }
+
+    def _providers_to_try(self) -> list[str]:
+        configured = self.configured_providers()
+        if not configured:
+            return []
+        return configured if self.allow_fallback else configured[:1]
+
+    # ---- main entry ----
+    def complete(self, agent_id: str, system: str, user: str) -> dict:
+        order = self._providers_to_try()
+        if not order:
+            return {"ok": True, "text": "", "provider": "mock", "model": "none",
+                    "mode": "mock", "mock": True,
+                    "error": "No provider configured — deterministic mock mode"}
+
+        attempts: list[dict] = []
+        for provider in order:
+            adapter = self.adapters[provider]
+            # Per-agent model only applies when it matches the provider family.
+            adapter.model = self.cfg.model_for(agent_id, provider)
+            result = adapter.complete(system, user)
+            if result.get("ok"):
+                self._record(provider, result, agent_id)
+                result["mode"] = "live"
+                result["mock"] = False
+                result["attempts"] = attempts
+                return result
+            attempts.append({"provider": provider, "status": result.get("status"),
+                             "error": result.get("error", "")[:200]})
+            log.warning("provider %s failed (%s): %s", provider, result.get("status"),
+                        result.get("error", "")[:200])
+            if not self.allow_fallback:
+                break
+        return {"ok": False, "status": "ALL_PROVIDERS_FAILED", "mode": "failed", "mock": False,
+                "error": "All configured providers failed",
+                "providers_configured": order, "attempts": attempts}
+
+    def _record(self, provider: str, result: dict, agent_id: str) -> None:
+        if self.db is None:
+            return
+        pt = int(result.get("prompt_tokens", 0) or 0)
+        ct = int(result.get("completion_tokens", 0) or 0)
+        rate = COST_PER_M.get(provider, (0.0, 0.0))
+        cost = (pt * rate[0] + ct * rate[1]) / 1_000_000
+        try:
+            self.db.record_usage(provider, result.get("model", ""), agent_id, pt, ct, cost)
+        except Exception:
+            log.debug("usage recording failed", exc_info=True)

@@ -1,6 +1,8 @@
-# Phone AI Agent Team — minimal deps for 3GB RAM Termux
-# Core uses ONLY stdlib. Optional deps below are for Telegram + AI.
-python-telegram-bot>=21.0,<23.0
-requests>=2.31
-# Dev / tests
-pytest>=8.0
+# Phone AI Agent Team — runtime dependency list
+#
+# The runtime uses ONLY the Python standard library (3.10+): sqlite3, urllib,
+# http.server, zipfile, threading, subprocess, json. Nothing else is required
+# to run the agents, the router, the database or the Telegram bot.
+#
+# pytest is the only development dependency.
+pytest>=8.0,<10.0

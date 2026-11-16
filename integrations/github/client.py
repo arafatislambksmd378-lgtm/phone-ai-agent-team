@@ -1,38 +1,60 @@
-"""GitHub integration — local git ops + API status. Honest failure reporting."""
+"""GitHub integration — read-only status by default; writes always need approval."""
 from __future__ import annotations
+
+import json
+import os
 import subprocess
 import urllib.request
-import json
+
+DEFAULT_REPO = "arafatislambksmd378-lgtm/phone-ai-agent-team"
+
 
 class GitHubClient:
-    def __init__(self, repo_url: str = "https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team", token: str = ""):
-        self.repo_url = repo_url
-        self.token = token
+    """Local git inspection + public repository metadata.
 
-    def git_status(self, cwd: str = ".") -> dict:
+    No token is stored or required for status. Any mutating operation
+    (commit/push) is *not* performed here: it must go through the approval
+    workflow first (see ApprovalManager), per the project's safety contract.
+    """
+
+    def __init__(self, repo: str = DEFAULT_REPO, token: str | None = None):
+        self.repo = repo
+        self.token = token or os.getenv("GITHUB_TOKEN", "")
+
+    # ---------- local git ----------
+    def _git(self, args: list[str], cwd: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=30)
+
+    def status(self, cwd: str = ".") -> dict:
         try:
-            r = subprocess.run(["git", "status", "--porcelain"], cwd=cwd, capture_output=True, text=True, timeout=15)
-            branch = subprocess.run(["git", "branch", "--show-current"], cwd=cwd, capture_output=True, text=True, timeout=10).stdout.strip()
-            return {"ok": True, "branch": branch, "dirty": bool(r.stdout.strip()), "output": r.stdout[:2000]}
+            branch = self._git(["branch", "--show-current"], cwd).stdout.strip()
+            porcelain = self._git(["status", "--porcelain"], cwd).stdout
+            ahead = self._git(["rev-list", "--count", "@{u}..HEAD"], cwd).stdout.strip()
+            return {"ok": True, "branch": branch, "dirty": bool(porcelain.strip()),
+                    "changed_files": len([l for l in porcelain.splitlines() if l.strip()]),
+                    "unpushed_commits": int(ahead) if ahead.isdigit() else None}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def git_commit(self, cwd: str, message: str) -> dict:
+    def log(self, cwd: str = ".", limit: int = 10) -> dict:
         try:
-            subprocess.run(["git", "add", "-A"], cwd=cwd, capture_output=True, timeout=30)
-            r = subprocess.run(["git", "commit", "-m", message], cwd=cwd, capture_output=True, text=True, timeout=30)
-            return {"ok": r.returncode == 0, "stdout": r.stdout[:1000], "stderr": r.stderr[:1000]}
+            out = self._git(["log", f"-{limit}", "--pretty=%h|%s"], cwd).stdout
+            return {"ok": True, "commits": [l for l in out.splitlines() if "|" in l]}
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
-    def api_repo(self) -> dict:
-        # Public repo info without auth
+    # ---------- remote metadata ----------
+    def repo_info(self) -> dict:
+        url = f"https://api.github.com/repos/{self.repo}"
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "phone-ai-agent-team"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
         try:
-            url = "https://api.github.com/repos/arafatislambksmd378-lgtm/phone-ai-agent-team"
-            req = urllib.request.Request(url, headers={"Accept": "application/vnd.github+json"})
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=15) as r:
                 d = json.loads(r.read().decode())
-            return {"ok": True, "full_name": d.get("full_name"), "default_branch": d.get("default_branch"),
-                    "pushed_at": d.get("pushed_at")}
+            return {"ok": True, "full_name": d.get("full_name"),
+                    "default_branch": d.get("default_branch"),
+                    "private": d.get("private"), "pushed_at": d.get("pushed_at")}
         except Exception as e:
             return {"ok": False, "error": str(e)}
