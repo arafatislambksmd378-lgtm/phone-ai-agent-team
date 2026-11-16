@@ -1,0 +1,17 @@
+[project]
+name = "phone-ai-agent-team"
+version = "1.0.0"
+description = "On-demand 16-agent AI software development automation for Android Termux"
+requires-python = ">=3.10"
+dependencies = ["python-telegram-bot>=21.0,<23.0", "requests>=2.31"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools.packages.find]
+include = ["config*", "orchestrator*", "agents*", "integrations*", "execution*", "memory*", "security*"]
