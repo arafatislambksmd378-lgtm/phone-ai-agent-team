@@ -34,8 +34,9 @@ def test_context_is_bound_and_pinned_to_commit(tmp_path):
 
 def test_invalid_secret_symlink_and_mismatch_rejected(tmp_path):
     svc, api, pid = make_service(tmp_path)
-    for path in ("../x", ".env", "keys/private.key", "password.txt"):
+    for path in ("../x", ".env", ".env.production", "secrets/config.py", "keys/private.key", "password.txt"):
         assert not collect_selected_context(svc, pid, [path])["ok"]
+    api.branch_sha.assert_not_called()
     api.list_dir.return_value["data"][0]["type"] = "symlink"
     assert not collect_selected_context(svc, pid, ["src/app.py"])["ok"]
     api.list_dir.return_value["data"][0]["type"] = "file"

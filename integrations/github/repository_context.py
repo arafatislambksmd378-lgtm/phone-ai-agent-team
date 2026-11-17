@@ -17,7 +17,7 @@ MAX_FILES = 12
 MAX_FILE_BYTES = 64 * 1024
 MAX_TOTAL_BYTES = 256 * 1024
 _SHA = re.compile(r"^[0-9a-f]{40}$")
-_SECRET_NAMES = re.compile(r"(?i)(?:^|[._-])(secret|credential|private[_-]?key|token|password)(?:[._-]|$)")
+_SECRET_NAMES = re.compile(r"(?i)(?:^|[._-])(secrets?|credentials?|private[_-]?key|tokens?|passwords?)(?:[._-]|$)")
 _SECRET_EXTENSIONS = {".pem", ".key", ".p12", ".pfx", ".jks", ".keystore"}
 
 
@@ -37,7 +37,10 @@ def collect_selected_context(service, project_id: str, paths: list[str], branch:
     for path in paths:
         valid, clean = validate_repo_path(path, allow_empty=False)
         leaf = PurePosixPath(clean).name if valid else ""
-        if not valid or _SECRET_NAMES.search(leaf) or PurePosixPath(leaf).suffix.lower() in _SECRET_EXTENSIONS:
+        parts = PurePosixPath(clean).parts if valid else ()
+        if (not valid or any(part.lower() == ".env" or part.lower().startswith(".env.")
+                             or _SECRET_NAMES.search(part) for part in parts)
+                or PurePosixPath(leaf).suffix.lower() in _SECRET_EXTENSIONS):
             return {"ok": False, "status": 400, "error": "A selected path is invalid or may contain credentials"}
         if clean in checked:
             return {"ok": False, "status": 400, "error": "Duplicate selected paths are not allowed"}
