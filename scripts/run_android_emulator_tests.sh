@@ -8,10 +8,11 @@ import glob, xml.etree.ElementTree as ET
 files = glob.glob('app/build/outputs/androidTest-results/connected/**/*.xml', recursive=True)
 tests = sum(int(ET.parse(path).getroot().get('tests', 0)) for path in files)
 failures = sum(int(ET.parse(path).getroot().get('failures', 0)) + int(ET.parse(path).getroot().get('errors', 0)) for path in files)
-print(f'Instrumentation XML reports: {len(files)}; tests: {tests}; failures: {failures}')
-if tests < 2 or failures:
+skipped = sum(int(ET.parse(path).getroot().get('skipped', 0)) for path in files)
+print(f'Instrumentation XML reports: {len(files)}; tests: {tests}; skipped: {skipped}; failures: {failures}')
+if tests - skipped < 2 or failures:
     raise SystemExit('Missing or failed instrumentation tests; refusing a false green')
-print(f'::notice title=Android instrumentation::tests={tests} failures={failures}')
+print(f'::notice title=Android instrumentation::tests={tests} skipped={skipped} failures={failures}')
 PY
 mkdir -p ../emulator-screenshots
 for name in home settings projects; do
