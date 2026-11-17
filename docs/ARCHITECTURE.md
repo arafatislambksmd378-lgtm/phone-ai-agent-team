@@ -1,3 +1,7 @@
+# Safety and currency notice
+
+This is a historical architecture sketch, not evidence of a functioning isolation boundary. Host and GitHub agent execution are currently blocked pending an independently verified remote worker. See `implementation/PHASE41_ISOLATED_WORKER_REQUIREMENTS.md` and the latest Phase 4.1 report.
+
 # System Architecture
 
 ## 1. Design Philosophy: On-Demand Logical Agents on 3 GB RAM
@@ -30,7 +34,7 @@ Blueprint (Telegram text / TXT / MD / PDF / DOCX / JSON / CSV / ZIP)
         ▼
 [AgentRegistry → 16 Logical Agents]         ──► Receives verified HandoffEnvelopes from upstream parents
         │                                       Calls ModelRouter (Gemini / OpenAI / Codex / Anthropic)
-        │                                       Executes sandboxed tools (FileManager / ProcessManager)
+        │                                       Historical tools (execution currently blocked; no proven sandbox)
         ▼
 [HandoffManager + Git Sandbox]              ──► Verifies output files + SHA-256 digests, commits Git
         │                                       checkpoint, propagates failures to downstream dependents

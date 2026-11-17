@@ -19,6 +19,10 @@ class FileManager:
         self.project_id = project_id
 
     def _p(self, rel: str) -> Path:
+        # Project content must not be able to plant Git hooks or alter repository config.
+        parts = rel.replace("\\", "/").split("/")
+        if ".git" in parts:
+            raise PermissionError("Git metadata is not accessible through the workspace file manager")
         return safe_join(self.workspace, rel)
 
     def _is_protected(self, rel: str) -> bool:

@@ -104,6 +104,22 @@ class GitHubClient:
             return {"ok": False, "error": redact(res.stderr.strip() or "git remote failed")}
         return {"ok": True, "remote": remote_name, "url": url}
 
+    def resolve_branch(self, cwd: str, remote_name: str = "origin", explicit_branch: str | None = None) -> str:
+        """Determine target branch without hardcoding 'main': explicit -> current -> remote HEAD -> API metadata."""
+        if explicit_branch and explicit_branch.strip():
+            return explicit_branch.strip()
+        cur = Sandbox(cwd).current_branch()
+        if cur and cur != "HEAD":
+            return cur
+        sym = self._git(["symbolic-ref", "--short", f"refs/remotes/{remote_name}/HEAD"], cwd).stdout.strip()
+        if sym and "/" in sym:
+            return sym.split("/", 1)[1].strip()
+        if self.repo and self.token:
+            info = self.repo_info()
+            if info.get("ok") and info.get("default_branch"):
+                return str(info["default_branch"]).strip()
+        return ""
+
     # ---------- secret scan & remote push/pull/verify ----------
     def scan_before_publish(self, cwd: str) -> dict:
         findings = Sandbox(cwd).scan_secrets()
@@ -159,7 +175,9 @@ class GitHubClient:
                 "error": f"Push blocked pending human approval ({msg})",
             }
 
-        target_branch = branch or Sandbox(cwd).current_branch() or "main"
+        target_branch = self.resolve_branch(cwd, remote_name, branch)
+        if not target_branch:
+            return {"ok": False, "error": "Could not determine target branch; specify branch explicitly"}
         res = self._git(["push", "-u", remote_name, target_branch], cwd, timeout=60)
         if res.returncode != 0:
             return {"ok": False, "error": redact(res.stderr.strip() or "git push failed")}
@@ -167,7 +185,9 @@ class GitHubClient:
 
     def pull(self, cwd: str, remote_name: str = "origin", branch: str | None = None) -> dict:
         """Pull with fast-forward preference and explicit merge-conflict detection."""
-        target_branch = branch or Sandbox(cwd).current_branch() or "main"
+        target_branch = self.resolve_branch(cwd, remote_name, branch)
+        if not target_branch:
+            return {"ok": False, "error": "Could not determine target branch; specify branch explicitly"}
         res = self._git(["pull", "--no-edit", remote_name, target_branch], cwd, timeout=60)
         conflicts = Sandbox(cwd).conflict_files()
         if conflicts:
@@ -197,7 +217,9 @@ class GitHubClient:
         if remote_name not in remotes:
             return {"ok": True, "mode": "local_only", "head": local_head}
 
-        branch = sb.current_branch() or "main"
+        branch = self.resolve_branch(cwd, remote_name)
+        if not branch:
+            return {"ok": False, "error": "Could not determine current branch for remote verification"}
         ls_rem = self._git(["ls-remote", remote_name, f"refs/heads/{branch}"], cwd, timeout=30)
         if ls_rem.returncode != 0:
             return {"ok": False, "mode": "remote_unreachable", "head": local_head,

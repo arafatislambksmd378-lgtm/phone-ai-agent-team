@@ -37,10 +37,12 @@ class Sandbox:
             "GIT_COMMITTER_NAME": "PhoneAgent",
             "GIT_COMMITTER_EMAIL": "agent@local",
             "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
         }
         if extra_env:
             env.update(extra_env)
-        return subprocess.run(["git", *args], cwd=str(self.workspace), capture_output=True,
+        return subprocess.run(["git", "-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false", *args], cwd=str(self.workspace), capture_output=True,
                               text=True, timeout=timeout, env=env)
 
     def is_repo(self) -> bool:

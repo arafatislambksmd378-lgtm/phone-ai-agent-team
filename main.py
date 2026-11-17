@@ -164,9 +164,15 @@ def _remove_pid() -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Phone AI Agent Team")
     ap.add_argument("--web", action="store_true", help="launch API Key & Live Verification web page")
-    ap.add_argument("--api", action="store_true", help="serve shared Android/Telegram JSON API")
-    ap.add_argument("--api-port", type=int, default=8000)
-    ap.add_argument("--host", default="0.0.0.0", help="with --web: bind host (default 0.0.0.0)")
+    ap.add_argument("--api", action="store_true", help="serve authenticated Android JSON API + Orchestrator")
+    ap.add_argument("--with-api", action="store_true", help="run Telegram bot AND authenticated Android API together")
+    ap.add_argument("--api-host", default=os.getenv("API_HOST", "127.0.0.1"),
+                    help="with --api/--with-api: bind host (default 127.0.0.1; use behind HTTPS reverse proxy)")
+    ap.add_argument("--api-port", type=int, default=int(os.getenv("API_PORT", "8000")),
+                    help="with --api/--with-api: bind port (default 8000)")
+    ap.add_argument("--tls-cert", default=os.getenv("API_TLS_CERT", ""), help="optional PEM TLS certificate path")
+    ap.add_argument("--tls-key", default=os.getenv("API_TLS_KEY", ""), help="optional PEM TLS private key path")
+    ap.add_argument("--host", default="127.0.0.1", help="with --web: bind host (default 127.0.0.1)")
     ap.add_argument("--port", type=int, default=int(os.getenv("WEB_SETUP_PORT", "8080")),
                     help="with --web: bind port (default 8080)")
     ap.add_argument("--demo", action="store_true", help="run a local pipeline without Telegram")
@@ -177,26 +183,27 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--recover", action="store_true")
     ap.add_argument("--selfcheck", action="store_true")
     args = ap.parse_args(argv)
-    if getattr(args, "api", False):
-        from config.settings import Settings as _S
-        from memory.database import Database as _D
-        from integrations.api.server import serve as _serve
-        _s = _S(); _serve(_D(_s.db_path), port=args.api_port, api_token=__import__("os").getenv("API_AUTH_TOKEN", "")); return 0
 
     settings = get_settings()
     settings.ensure_dirs()
     setup_logging(settings)
 
     if args.web:
+        import threading
         from integrations.web.setup_server import create_setup_http_server
-        srv = create_setup_http_server(host=args.host, port=args.port)
+        try:
+            srv = create_setup_http_server(
+                host=args.host, port=args.port, auth_token=settings.web_setup_token,
+            )
+        except ValueError as ve:
+            log.error("%s", ve)
+            return 1
         log.info("API Key & Live Verification Portal listening on http://%s:%d", args.host, args.port)
 
         def _web_shutdown(signum, frame):
             log.info("signal %s — stopping web portal", signum)
             threading.Thread(target=srv.shutdown, daemon=True).start()
 
-        import threading
         signal.signal(signal.SIGINT, _web_shutdown)
         signal.signal(signal.SIGTERM, _web_shutdown)
         try:
@@ -207,8 +214,48 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     engine = OrchestratorEngine(settings)
+    api_srv = None
 
     try:
+        if args.api:
+            import threading
+            from integrations.api.server import create_api_server
+            from integrations.github.api import GitHubAPI
+            from integrations.github.executor import GitHubExecutionService
+
+            gh_svc = GitHubExecutionService(engine.db, GitHubAPI(settings.github_token), engine.approvals)
+            try:
+                api_srv = create_api_server(
+                    engine.db,
+                    host=args.api_host,
+                    port=args.api_port,
+                    api_token=settings.api_auth_token,
+                    github_service=gh_svc,
+                    engine=engine,
+                    tls_cert=args.tls_cert,
+                    tls_key=args.tls_key,
+                    max_upload_mb=settings.max_upload_mb,
+                )
+            except ValueError as ve:
+                log.error("%s", ve)
+                return 1
+            rec = engine.startup_recovery()
+            if rec["interrupted"]:
+                log.info("startup recovery requeued %d task(s)", rec["interrupted"])
+            scheme = "https" if (args.tls_cert and args.tls_key) else "http"
+            log.info("Authenticated Android API + Orchestrator listening on %s://%s:%d",
+                     scheme, args.api_host, api_srv.server_address[1])
+            _write_pid()
+
+            def _api_shutdown(signum, frame):
+                log.info("signal %s — stopping API server", signum)
+                threading.Thread(target=api_srv.shutdown, daemon=True).start()
+
+            signal.signal(signal.SIGINT, _api_shutdown)
+            signal.signal(signal.SIGTERM, _api_shutdown)
+            api_srv.serve_forever()
+            return 0
+
         if args.status:
             return cmd_status(engine)
         if args.health:
@@ -226,11 +273,38 @@ def main(argv: list[str] | None = None) -> int:
         for e in errors:
             log.warning(e)
         if not settings.telegram_bot_token:
-            log.error("TELEGRAM_BOT_TOKEN is not set. Copy .env.example to .env, or run --demo.")
+            log.error("TELEGRAM_BOT_TOKEN is not set. Copy .env.example to .env, or run --demo / --api.")
             return 1
         if not settings.telegram_allowed_user_id:
             log.error("TELEGRAM_ALLOWED_USER_ID is not set — every command would be rejected.")
             return 1
+
+        # Optionally co-host the authenticated Android API sharing the SAME Orchestrator & Database
+        if args.with_api or settings.enable_api_server:
+            import threading
+            from integrations.api.server import create_api_server
+            from integrations.github.api import GitHubAPI
+            from integrations.github.executor import GitHubExecutionService
+
+            gh_svc = GitHubExecutionService(engine.db, GitHubAPI(settings.github_token), engine.approvals)
+            try:
+                api_srv = create_api_server(
+                    engine.db,
+                    host=args.api_host,
+                    port=args.api_port,
+                    api_token=settings.api_auth_token,
+                    github_service=gh_svc,
+                    engine=engine,
+                    tls_cert=args.tls_cert,
+                    tls_key=args.tls_key,
+                    max_upload_mb=settings.max_upload_mb,
+                )
+            except ValueError as ve:
+                log.error("%s", ve)
+                return 1
+            threading.Thread(target=api_srv.serve_forever, daemon=True, name="android-api-server").start()
+            scheme = "https" if (args.tls_cert and args.tls_key) else "http"
+            log.info("Shared Android API co-hosted on %s://%s:%d", scheme, args.api_host, api_srv.server_address[1])
 
         from integrations.telegram.bot import TelegramBot
         handler = TelegramHandler(engine, settings)
@@ -262,6 +336,12 @@ def main(argv: list[str] | None = None) -> int:
         bot.run_forever()
         return 0
     finally:
+        if api_srv is not None:
+            try:
+                api_srv.shutdown()
+                api_srv.server_close()
+            except Exception:
+                pass
         _remove_pid()
         engine.shutdown()
 

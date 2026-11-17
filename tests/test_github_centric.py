@@ -15,6 +15,7 @@ def fake_api(calls):
     def opener(req, timeout=20):
         calls.append((req.method, req.full_url, req.data and json.loads(req.data)))
         u=req.full_url
+        if u.endswith("/repos/o/r"): return Resp({"default_branch":"develop"})
         if "/git/ref/" in u: return Resp({"object":{"sha":"abc"}})
         if "/pulls" in u and req.method=="POST": return Resp({"number":7,"html_url":"https://github.com/o/r/pull/7"})
         return Resp({"sha":"f1"})
@@ -59,16 +60,16 @@ def test_api_auth_and_shared_telegram_state(tmp_path):
     from security.approval import ApprovalManager
     import threading, urllib.request
     db=Database(tmp_path/"s.db")
-    srv=ThreadingHTTPServer(("127.0.0.1",0), make_handler(db,"secret")); port=srv.server_address[1]
+    srv=ThreadingHTTPServer(("127.0.0.1",0), make_handler(db,"test-token-AbC9876-long-enough-12345")); port=srv.server_address[1]
     threading.Thread(target=srv.serve_forever,daemon=True).start()
     # unauthenticated rejected
     try:
         urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{port}/api/projects"),timeout=5); assert False
     except urllib.error.HTTPError as e: assert e.code==401
-    req=urllib.request.Request(f"http://127.0.0.1:{port}/api/projects", data=b'{"name":"FromAndroid"}', method="POST", headers={"Authorization":"Bearer secret","Content-Type":"application/json"})
+    req=urllib.request.Request(f"http://127.0.0.1:{port}/api/projects", data=b'{"name":"FromAndroid"}', method="POST", headers={"Authorization":"Bearer test-token-AbC9876-long-enough-12345","Content-Type":"application/json"})
     pid=_json.loads(urllib.request.urlopen(req,timeout=5).read())["id"]
     # same row visible to Telegram side (shared DB): approval decided via API is pending in DB
-    req=urllib.request.Request(f"http://127.0.0.1:{port}/api/projects/{pid}/approvals", data=b'{"action":"git_push","detail":"merge PR"}', method="POST", headers={"Authorization":"Bearer secret","Content-Type":"application/json"})
+    req=urllib.request.Request(f"http://127.0.0.1:{port}/api/projects/{pid}/approvals", data=b'{"action":"git_push","detail":"merge PR"}', method="POST", headers={"Authorization":"Bearer test-token-AbC9876-long-enough-12345","Content-Type":"application/json"})
     aid=_json.loads(urllib.request.urlopen(req,timeout=5).read())["id"]
     assert ApprovalManager(db).pending(pid)[0]["id"]==aid
     srv.shutdown()
@@ -78,6 +79,7 @@ def test_agent_execution_verified_on_mocked_github(tmp_path):
     def opener(req, timeout=20):
         calls.append((req.method, req.full_url))
         u=req.full_url
+        if u.endswith('/repos/owner/repo'): return _Resp({'default_branch':'trunk'})
         if "/git/ref/" in u: return _Resp({"object":{"sha":"abc"}})
         if "/compare/" in u: return _Resp({"files":[{"filename":"app.py"}],"ahead_by":1})
         return _Resp({"sha":"new","content":{"sha":"c1"}})

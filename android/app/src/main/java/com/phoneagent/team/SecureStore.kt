@@ -1,4 +1,5 @@
 package com.phoneagent.team
+
 import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
@@ -8,26 +9,69 @@ import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
-/** API token encrypted with an Android Keystore AES-GCM key; never logged, never sent to GitHub/AI. */
+
+/**
+ * Stores only the backend URL, active project ID, and backend Bearer token encrypted under an
+ * Android Keystore AES-256-GCM hardware/TEE-backed key. No GitHub, Telegram, or LLM API key is
+ * ever stored in or transmitted to the Android application.
+ */
 class SecureStore(ctx: Context) {
-  private val prefs = ctx.getSharedPreferences("secure", Context.MODE_PRIVATE)
+  private val prefs = ctx.getSharedPreferences("phone_agent_secure", Context.MODE_PRIVATE)
+  private val legacyPrefs = ctx.getSharedPreferences("secure", Context.MODE_PRIVATE)
+
   private fun key(): SecretKey {
     val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-    (ks.getKey("api_key", null) as? SecretKey)?.let { return it }
+    (ks.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }
     val gen = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
-    gen.init(KeyGenParameterSpec.Builder("api_key", KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
-      .setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build())
+    gen.init(
+      KeyGenParameterSpec.Builder(
+        KEY_ALIAS,
+        KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT,
+      )
+        .setKeySize(256)
+        .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+        .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+        .build()
+    )
     return gen.generateKey()
   }
+
   fun save(name: String, value: String) {
-    val c = Cipher.getInstance("AES/GCM/NoPadding"); c.init(Cipher.ENCRYPT_MODE, key())
-    val data = Base64.encodeToString(c.iv, 0) + ":" + Base64.encodeToString(c.doFinal(value.toByteArray()), 0)
-    prefs.edit().putString(name, data).apply()
+    if (value.isEmpty()) {
+      prefs.edit().remove(name).apply()
+      legacyPrefs.edit().remove(name).apply()
+      return
+    }
+    val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+    cipher.init(Cipher.ENCRYPT_MODE, key())
+    val iv = Base64.encodeToString(cipher.iv, Base64.NO_WRAP)
+    val ct = Base64.encodeToString(cipher.doFinal(value.toByteArray(Charsets.UTF_8)), Base64.NO_WRAP)
+    prefs.edit().putString(name, "$iv:$ct").apply()
   }
+
   fun load(name: String, default: String = ""): String {
-    val raw = prefs.getString(name, null) ?: return default
-    return try { val p = raw.split(":"); val c = Cipher.getInstance("AES/GCM/NoPadding")
-      c.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, Base64.decode(p[0], 0)))
-      String(c.doFinal(Base64.decode(p[1], 0))) } catch (e: Exception) { default }
+    val fromLegacy = !prefs.contains(name)
+    val raw = (if (fromLegacy) legacyPrefs else prefs).getString(name, null) ?: return default
+    return try {
+      val parts = raw.split(":", limit = 2)
+      if (parts.size != 2) return default
+      val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+      val spec = GCMParameterSpec(128, Base64.decode(parts[0], Base64.DEFAULT))
+      cipher.init(Cipher.DECRYPT_MODE, key(), spec)
+      val value = String(cipher.doFinal(Base64.decode(parts[1], Base64.DEFAULT)), Charsets.UTF_8)
+      if (fromLegacy) save(name, value)
+      value
+    } catch (_: Exception) {
+      default
+    }
+  }
+
+  fun remove(name: String) {
+    prefs.edit().remove(name).apply()
+    legacyPrefs.edit().remove(name).apply()
+  }
+
+  companion object {
+    private const val KEY_ALIAS = "api_key"
   }
 }

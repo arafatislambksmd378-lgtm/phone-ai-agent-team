@@ -10,6 +10,7 @@ import csv
 import io
 import json
 import re
+import struct
 import subprocess
 import xml.etree.ElementTree as ET
 import zipfile
@@ -17,9 +18,14 @@ import zlib
 from pathlib import Path
 
 TEXT_EXTENSIONS = {
-    ".txt", ".md", ".py", ".js", ".ts", ".kt", ".java", ".html", ".css",
+    ".txt", ".md", ".rst", ".py", ".js", ".ts", ".tsx", ".jsx",
+    ".kt", ".kts", ".java", ".go", ".rs", ".c", ".cpp", ".h",
+    ".rb", ".php", ".swift", ".dart", ".html", ".css",
     ".yaml", ".yml", ".toml", ".sql", ".sh", ".xml",
+    ".gradle", ".properties", ".ini", ".cfg",
 }
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 
 MAX_DECOMPRESSED_XML = 10 * 1024 * 1024   # 10 MB XML bomb cap for DOCX
 MAX_PDF_STREAM_BYTES = 8 * 1024 * 1024    # 8 MB per PDF stream decompression cap
@@ -56,6 +62,10 @@ def extract_document_text(path: str | Path, filename: str | None = None,
             text = _extract_csv(p, max_chars=max_chars)
             return {"ok": True, "kind": "csv", "text": text[:max_chars],
                     "chars": len(text[:max_chars]), "warning": ""}
+        if ext in IMAGE_EXTENSIONS:
+            desc = _extract_image_metadata(p, name, ext)
+            return {"ok": True, "kind": "image", "text": desc[:max_chars],
+                    "chars": len(desc[:max_chars]), "warning": ""}
         if ext in TEXT_EXTENSIONS:
             raw = p.read_bytes()[: max_chars * 2].decode("utf-8", errors="replace")
             return {"ok": True, "kind": ext.lstrip(".") or "text", "text": raw[:max_chars],
@@ -99,6 +109,48 @@ def extract_directory_corpus(directory: str | Path, max_files: int = 25,
 
 
 # ---------- format extractors ----------
+
+def _extract_image_metadata(path: Path, filename: str, ext: str) -> str:
+    """Safely inspect image dimensions from header bytes (pure stdlib, never executes)."""
+    size = path.stat().st_size
+    head = path.read_bytes()[:65536]
+    width, height, fmt = 0, 0, ext.lstrip(".").upper()
+    if head.startswith(b"\x89PNG\r\n\x1a\n") and len(head) >= 24 and head[12:16] == b"IHDR":
+        fmt = "PNG"
+        width, height = struct.unpack(">II", head[16:24])
+    elif head.startswith((b"GIF87a", b"GIF89a")) and len(head) >= 10:
+        fmt = "GIF"
+        width, height = struct.unpack("<HH", head[6:10])
+    elif len(head) >= 30 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        fmt = "WEBP"
+        chunk = head[12:16]
+        if chunk == b"VP8X" and len(head) >= 30:
+            width = 1 + int.from_bytes(head[24:27], "little")
+            height = 1 + int.from_bytes(head[27:30], "little")
+        elif chunk == b"VP8 " and len(head) >= 30 and head[23:26] == b"\x9d\x01\x2a":
+            width = struct.unpack("<H", head[26:28])[0] & 0x3FFF
+            height = struct.unpack("<H", head[28:30])[0] & 0x3FFF
+    elif head.startswith(b"\xff\xd8\xff"):
+        fmt = "JPEG"
+        idx = 2
+        while idx + 9 < len(head):
+            if head[idx] != 0xFF:
+                idx += 1
+                continue
+            marker = head[idx + 1]
+            if marker in (0xC0, 0xC1, 0xC2, 0xC3):
+                height, width = struct.unpack(">HH", head[idx + 5: idx + 9])
+                break
+            if marker in (0xD8, 0xD9) or (0xD0 <= marker <= 0xD7):
+                idx += 2
+                continue
+            seg_len = struct.unpack(">H", head[idx + 2: idx + 4])[0]
+            if seg_len < 2:
+                break
+            idx += 2 + seg_len
+    dim = f"{width}x{height}px" if (width and height) else "dimensions unparsed"
+    return f"Reference UI/design image asset: {filename} ({fmt}, {dim}, {size} bytes)."
+
 
 def _extract_json(path: Path, max_chars: int = 80_000) -> str:
     raw = path.read_bytes()[: max_chars * 2].decode("utf-8", errors="replace")

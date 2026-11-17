@@ -22,7 +22,7 @@ jobs:
           set -o pipefail
           gradle testDebugUnitTest assembleDebug --no-daemon 2>&1 | tee ../android-build.log
       - name: Surface build errors
-        if: always()
+        if: failure()
         run: |
           MSG=$(grep -B2 -A8 "What went wrong" android-build.log | head -14 | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')
           echo "::error::${MSG:-no error lines matched}"
@@ -34,6 +34,15 @@ jobs:
           find . -name "*.apk" -exec cp {} apk-out/ \;
           ls -lh apk-out/
           test -n "$(ls -A apk-out)"
+          for apk in apk-out/*.apk; do
+            size=$(stat -c %s "$apk")
+            hash=$(sha256sum "$apk" | cut -d' ' -f1)
+            echo "APK bytes: $size"
+            version=$($ANDROID_HOME/build-tools/34.0.0/aapt dump badging "$apk" | head -1)
+            echo "APK SHA-256: $hash"
+            echo "$version"
+            echo "::notice title=APK metadata::bytes=$size sha256=$hash commit=$GITHUB_SHA $version"
+          done
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
@@ -41,7 +50,10 @@ jobs:
           name: android-build-log
           path: android-build.log
       - name: Upload APK
+        id: apk
         uses: actions/upload-artifact@v4
         with:
           name: app-debug-apk
           path: apk-out/*.apk
+      - name: Record artifact identity
+        run: echo "::notice title=APK artifact::id=${{ steps.apk.outputs.artifact-id }} run=${{ github.run_id }} commit=${{ github.sha }} (artifact digest is for ZIP, not APK)"

@@ -1,0 +1,120 @@
+"""Phase 4 fail-closed and discovery regression tests; no live services."""
+import json
+from unittest.mock import Mock
+
+from agents.debugger.agent import Agent as Debugger
+from agents.qa_tester.agent import Agent as QA
+from execution.command_runner import CommandRunner
+from execution.file_manager import FileManager
+from integrations.github.api import GitHubAPI
+from integrations.github.executor import GitHubExecutionService
+from memory.database import Database
+
+
+def test_workspace_commands_never_run_on_host_even_if_approved(tmp_path, monkeypatch):
+    monkeypatch.setattr("execution.command_runner.subprocess.run", Mock(side_effect=AssertionError("executed on host")))
+    runner = CommandRunner(str(tmp_path))
+    result = runner.run("python3 project.py", approved=True)
+    assert not result["ok"] and result["blocked"] and "isolated worker" in result["error"]
+
+
+def test_pytest_is_blocked_in_each_agent_path_even_with_old_opt_in(tmp_path, monkeypatch):
+    monkeypatch.setenv("ALLOW_UNSANDBOXED_PROJECT_TESTS", "1")
+    monkeypatch.setattr("subprocess.run", Mock(side_effect=AssertionError("executed on host")))
+    qa = QA(workspace=str(tmp_path), file_manager=FileManager(str(tmp_path)))
+    debugger = Debugger(workspace=str(tmp_path), file_manager=FileManager(str(tmp_path)))
+    assert qa._run_pytest("test.py")[1] == "BLOCKED"
+    assert not debugger._run_pytest(["tests"])[0]
+    assert not GitHubExecutionService._run_workspace_pytest(tmp_path)["executed"]
+
+
+def test_github_execution_blocks_before_planning(tmp_path):
+    db = Database(tmp_path / "test.db")
+    pid = db.create_project("test", str(tmp_path))
+    db.bind_repository(pid, "owner/repo", "private", "trunk", "feature")
+    engine = Mock()
+    result = GitHubExecutionService(db, GitHubAPI("example")).execute_project_on_github(engine, pid, "fix authentication")
+    assert result["status"] == 503 and result["blocked"]
+    engine.start_project.assert_not_called()
+
+
+def test_github_pagination_does_not_follow_lookalike_host():
+    calls = []
+    class Response:
+        status = 200
+        headers = {"Link": '<https://api.github.com.attacker.invalid/repos?page=2>; rel="next"'}
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self): return json.dumps([{"name": "example"}]).encode()
+    def opener(req, timeout):
+        calls.append(req.full_url)
+        return Response()
+    api = GitHubAPI("example", opener=opener)
+    assert api.accessible_repositories()["ok"]
+    assert len(calls) == 1 and calls[0].startswith("https://api.github.com/")
+
+
+def test_repository_discovery_filters_response_fields():
+    api = GitHubAPI("example")
+    api._paged = lambda path: {"ok": True, "data": [{"full_name": "o/r", "private": True,
+        "default_branch": "develop", "permissions": {"push": True}, "sensitive_other_field": "not returned"}]}
+    result = api.accessible_repositories()
+    assert result["repositories"][0]["default_branch"] == "develop"
+    assert "sensitive_other_field" not in result["repositories"][0]
+
+
+def test_github_discovery_http_is_authenticated_and_uses_server_credential(tmp_path):
+    import threading
+    from integrations.api.server import create_api_server
+    from tests.test_phase3_security import TOKEN, request
+    db = Database(tmp_path / "discovery.db")
+    api = GitHubAPI("server-only-secret")
+    api._paged = lambda path: {"ok": True, "data": [{"full_name": "owner/repo", "private": True, "default_branch": "develop"}]}
+    server = create_api_server(db, port=0, api_token=TOKEN, github_service=GitHubExecutionService(db, api))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert request(server, "/api/github/repositories")[0] == 401
+        status, payload = request(server, "/api/github/repositories", TOKEN)
+        assert status == 200 and payload["repositories"][0]["full_name"] == "owner/repo"
+        assert "server-only-secret" not in json.dumps(payload)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
+def test_github_redirects_cannot_leak_credentials():
+    import urllib.error
+    import urllib.request
+    import pytest
+    from integrations.github.api import _SameOriginRedirect
+    handler = _SameOriginRedirect("https://api.github.com")
+    req = urllib.request.Request("https://api.github.com/user", headers={"Authorization": "Bearer hidden"})
+    with pytest.raises(urllib.error.HTTPError):
+        handler.redirect_request(req, None, 302, "Found", {}, "https://api.github.com.attacker.invalid/user")
+    same = handler.redirect_request(req, None, 302, "Found", {}, "https://api.github.com/user/repos")
+    assert same.full_url == "https://api.github.com/user/repos"
+
+
+def test_workspace_git_metadata_access_is_rejected(tmp_path):
+    import pytest
+    fm = FileManager(str(tmp_path))
+    for path in (".git/config", ".git/hooks/pre-commit", "nested/.git/hooks/post-commit"):
+        with pytest.raises(PermissionError):
+            fm.write(path, "unsafe")
+        with pytest.raises(PermissionError):
+            fm.read(path)
+
+
+def test_git_checkpoint_never_executes_project_hooks(tmp_path):
+    from execution.sandbox import Sandbox
+    sb = Sandbox(str(tmp_path))
+    assert sb.init_git()
+    hook = tmp_path / ".git/hooks/pre-commit"
+    marker = tmp_path / "hook-ran"
+    hook.write_text("#!/bin/sh\ntouch '" + str(marker) + "'\n")
+    hook.chmod(0o755)
+    (tmp_path / "file.txt").write_text("ok")
+    assert sb.checkpoint_commit("safe checkpoint")
+    assert not marker.exists()
