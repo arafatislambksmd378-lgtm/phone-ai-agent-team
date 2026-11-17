@@ -1,0 +1,2 @@
+# Security Architecture
+GitHub auth: PAT/OAuth token only from env/secure store, sent as Bearer header, never in git URLs, logs (redact()), commits, or to AI providers. Least privilege: `repo` scope (fine-grained: contents+PR+metadata RW on selected repos only). API server requires `API_AUTH_TOKEN` bearer, constant-time compare. Destructive ops (merge, delete, protected push, release) require ApprovalManager single-use TTL approval bound to user+task. ZIP guards, secret scan before push, and per-project repo isolation are enforced server-side.

@@ -1,0 +1,2 @@
+# Android Application Architecture
+Native Kotlin, single-activity, ViewBinding + HttpURLConnection (no heavy deps), minSdk 26. Screens: Dashboard, Projects, Repository, CodeWorkspace (edit + conflict check via remote SHA), GitChanges (diff + Create PR), Agents (16), Approvals, Settings. State comes only from the shared API server (same DB as Telegram) so dashboard↔Telegram stay in sync. Tokens stored via Android Keystore-backed EncryptedSharedPreferences equivalent (Keystore AES key in `SecureStore.kt`); API token never logged. APK built by GitHub Actions, not on-device.

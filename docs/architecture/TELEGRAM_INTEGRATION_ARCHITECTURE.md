@@ -1,0 +1,2 @@
+# Telegram Integration Architecture
+Existing bot/handler unchanged and bound to the same OrchestratorEngine/DB as the API server (`main.py --api` runs both). Telegram-created projects/tasks/approvals are rows in the same tables the Android app reads; approval callbacks keep existing dedup + TTL + single-use consumption. New: `/project` shows bound repo; PR links are sent on completion via existing completion callback.
