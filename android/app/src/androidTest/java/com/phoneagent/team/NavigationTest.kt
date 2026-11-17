@@ -6,6 +6,9 @@ import androidx.test.espresso.action.ViewActions.click
 import androidx.test.espresso.assertion.ViewAssertions.matches
 import androidx.test.espresso.matcher.ViewMatchers.*
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.platform.app.InstrumentationRegistry
+import android.graphics.Bitmap
+import java.io.File
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -13,18 +16,32 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class NavigationTest {
   @Test fun launchAndNavigateToSettingsAndProjects() {
+    val store = SecureStore(InstrumentationRegistry.getInstrumentation().targetContext)
+    listOf("base", "token", "project").forEach { store.remove(it) }
     ActivityScenario.launch(MainActivity::class.java).use {
       onView(withText("Your workspace")).check(matches(isDisplayed()))
-      onView(withText("•••\nMore")).perform(click())
+      screenshot("home")
+      onView(withContentDescription("Navigation: More")).perform(click())
       onView(withText("Settings")).perform(click())
       onView(withText("Save and test")).check(matches(isDisplayed()))
-      onView(withText("▧\nProjects")).perform(click())
+      screenshot("settings")
+      onView(withContentDescription("Navigation: Projects")).perform(click())
       onView(withText("Create project")).check(matches(isDisplayed()))
+      screenshot("projects")
       it.recreate()
       onView(withText("Your workspace")).check(matches(isDisplayed()))
-      onView(withText("•••\nMore")).perform(click())
+      onView(withContentDescription("Navigation: More")).perform(click())
       onView(withText("Telegram")).perform(click())
       onView(withText("Refresh status")).check(matches(isDisplayed()))
     }
+  }
+
+  private fun screenshot(name: String) {
+    val instrumentation = InstrumentationRegistry.getInstrumentation()
+    instrumentation.waitForIdleSync()
+    val bitmap = requireNotNull(instrumentation.uiAutomation.takeScreenshot())
+    val dir = File(instrumentation.targetContext.filesDir, "phase41-screenshots").apply { mkdirs() }
+    File(dir, "$name.png").outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+    bitmap.recycle()
   }
 }

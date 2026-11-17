@@ -25,7 +25,7 @@ jobs:
           arch: x86_64
           target: google_apis
           disable-animations: true
-          script: cd android && gradle connectedDebugAndroidTest --no-daemon
+          script: bash scripts/run_android_emulator_tests.sh
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
@@ -33,3 +33,10 @@ jobs:
           name: android-emulator-test-results
           path: android/app/build/reports/androidTests/connected/
           if-no-files-found: ignore
+      - name: Upload emulator screenshots
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android14-emulator-screenshots
+          path: emulator-screenshots/*.png
+          if-no-files-found: error

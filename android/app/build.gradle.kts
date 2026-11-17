@@ -11,8 +11,9 @@ android {
     applicationId = "com.phoneagent.team"
     minSdk = 26
     targetSdk = 34
-    versionCode = 2
-    versionName = "3.1.0"
+    versionCode = 4
+    versionName = "4.1.0-preview"
+    testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
 
   compileOptions {
@@ -38,4 +39,5 @@ dependencies {
   androidTestImplementation("androidx.test.ext:junit:1.2.1")
   androidTestImplementation("androidx.test:runner:1.6.2")
   androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")
+  androidTestImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 }

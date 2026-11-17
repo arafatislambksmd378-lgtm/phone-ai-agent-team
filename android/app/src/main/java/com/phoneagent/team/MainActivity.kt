@@ -86,9 +86,15 @@ class MainActivity : AppCompatActivity() {
     for (name in choices) {
       val active = screen == name || (name == "More" && screen in listOf("Repository", "Changes", "Pull Requests", "Approvals", "Activity", "Telegram", "Settings"))
       val nav = TextView(this).apply {
-        text = when (name) { "Dashboard" -> "⌂\nHome"; "Projects" -> "▧\nProjects"; "Code" -> "‹›\nCode"; "Agents" -> "✳\nAgents"; else -> "•••\nMore" }
+        text = if (name == "Dashboard") "Home" else name
+        contentDescription = "Navigation: $name"
         gravity = Gravity.CENTER; textSize = 11f; setTextColor(if (active) purple else muted)
-        setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL); minHeight = dp(56)
+        val icon = when (name) { "Dashboard" -> R.drawable.nav_home; "Projects" -> R.drawable.nav_projects; "Code" -> R.drawable.nav_code; "Agents" -> R.drawable.nav_agents; else -> R.drawable.nav_more }
+        val drawable = androidx.core.content.ContextCompat.getDrawable(this@MainActivity, icon)?.mutate()
+        drawable?.setTint(if (active) purple else muted)
+        setCompoundDrawablesWithIntrinsicBounds(null, drawable, null, null); compoundDrawablePadding = dp(3)
+        setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL); minHeight = dp(64)
+        if (active) background = shape(Color.rgb(244, 241, 255), 12)
         setOnClickListener {
           if (name != "More") navigate(name)
           else AlertDialog.Builder(this@MainActivity).setTitle("Workspace")

@@ -1,0 +1,17 @@
+# Phase 4.1 remaining-blocker audit
+
+Baseline: `be1e1aaa327967913f56f598c92ee5cad3114f1f`, PR #4 open, draft and unmerged. Working tree clean. No reference images were supplied.
+
+1. **Isolation / AI execution — BLOCKED.** `execution/isolation.py` always returns false. QA, debugger, workspace commands and GitHub agent execution are blocked. There is no remote worker, network authentication protocol, cgroup enforcement or independently verified filesystem/process isolation. The previous GitHub execution pipeline also has no real repository snapshot and can use deterministic fallbacks. No real AI-provider credentials were available. Do not enable the old host-subprocess paths.
+2. **Live services — BLOCKED.** No dedicated test repository was specified, and no dedicated Telegram bot, authorized account or live-model credential is available in this environment. Access to the user's project repository is not authorization to create test branches or destructive PRs. GitHub account/repository discovery was read-only in Phase 4; it is not proof of live write or merge workflows. Telegram API access is outside this sandbox's permitted internet hosts. No secrets should be sent in chat.
+3. **Android validation — NOT VERIFIED.** The Phase 4 `build.gradle.kts` lacks an explicit `testInstrumentationRunner`. CI green alone does not establish that AndroidJUnit4 tests actually ran. The emulator workflow did not assert a nonzero test count and captured no screenshots. The Phase 4 report incorrectly named version `4.0.0-preview`; source at its cited build commit says `3.1.0`. Correct version and test-count evidence rather than relying on the old report.
+4. **UI / function — PARTIALLY IMPLEMENTED.** The app is still a single, programmatic activity, with unstructured results on several screens, simplistic navigation and sparse accessibility coverage. Editor operations, authentication recovery and non-smoke backend interactions were not tested in a running app.
+5. **Infrastructure availability.** This sandbox has no Docker/Podman, Android SDK, emulator, `/dev/kvm`, Telegram credentials or model credentials. Linux user/network namespace `unshare -Urn true` is available but does not supply a separately operated remote worker, filesystem isolation, cgroups, worker authentication, a trusted runtime image or independent containment evidence. It is not a basis for claiming a secure worker.
+
+## Order of work
+
+- Preserve fail-closed execution. Specify a concrete independently verifiable worker deployment and acceptance/escape tests; no opt-in that runs on the backend host.
+- Add bounded, commit-pinned, explicitly selected repository context reading without dispatching it to an AI provider or enabling writes until the isolated worker and consent model exist. Test with mocked GitHub responses, and label the full AI workflow blocked.
+- Correct Android instrumentation runner, force CI to fail on zero tests, expand emulator testing with an explicitly fake test backend, capture screenshots from the actual emulator and upload them as a separate CI artifact. This does not establish live GitHub, Telegram or model functionality.
+- Correct artifact version evidence from Gradle, record exact run/artifact/commit IDs and distinguish APK hash from artifact-archive digest. Keep prior reports historically accurate through explicit corrections.
+- Run local Python and remote Android CI, capture what actually passed, and document outstanding live infrastructure/credential and device requirements. Keep PR #4 open and unmerged.

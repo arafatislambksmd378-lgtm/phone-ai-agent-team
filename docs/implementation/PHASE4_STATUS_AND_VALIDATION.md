@@ -1,6 +1,6 @@
 # Phase 4 status and validation
 
-**Status: incomplete; not production-ready.** PR #4 remains a draft. This document records evidence and blockers, not an acceptance claim. See `PHASE4_AUDIT_AND_PLAN.md` for the initial root-cause audit. No visual-reference attachments were available.
+**Status: incomplete; not production-ready.** PR #4 remains a draft. **Phase 4.1 correction:** the APK built at the commit cited below declares version `3.1.0`, not `4.0.0-preview`. Also, the old emulator workflow did not explicitly configure the AndroidJUnitRunner or verify a nonzero test count, so its green result does not establish that the cited instrumentation test actually ran. See `PHASE41_BLOCKER_AUDIT.md` and the latest Phase 4.1 verification report for corrected evidence. See `PHASE4_AUDIT_AND_PLAN.md` for the initial root-cause audit. No visual-reference attachments were available.
 
 ## Design and repairs
 
