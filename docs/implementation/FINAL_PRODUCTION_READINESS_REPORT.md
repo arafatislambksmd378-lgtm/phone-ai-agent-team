@@ -1,5 +1,7 @@
 # Phase 3 production readiness report
 
+> **Superseded for current behavior:** see [Phase 4 status and validation](PHASE4_STATUS_AND_VALIDATION.md). Host-side project execution is now blocked, so the earlier pipeline verification statements below no longer describe current behavior.
+
 **Not production ready.** This is an in-progress implementation. Tests and build success do not establish security or end-to-end usability. No PR was merged in this work. PR #3 was already merged before this session; this work is on the active session branch and must not be merged without a separate user decision.
 
 ## Verification classifications

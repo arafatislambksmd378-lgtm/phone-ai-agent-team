@@ -22,3 +22,7 @@ Inspection baseline: `151fb5f` on `arena/eb81fa85-phone-ai-agent-team`, PR #4 op
 - Fix editor rename and async-save data-loss paths; migrate stored settings safely. Add a read-only, authenticated server-side GitHub repository listing if it can be implemented without exposing credentials.
 - Add regression tests for every repaired backend/security path, and add Android UI/emulator tests when executable infrastructure is available. Build via CI, report the exact commit and artifact; never equate a successful build with a device test.
 - Obtain live integration evidence only using dedicated test infrastructure and credentials configured out of band. Until then classify live AI/GitHub, Telegram and isolated execution as blocked or unverified. Do not merge PR #4.
+
+### Additional hardening during implementation
+
+Workspace file access now rejects `.git` metadata and checkpoint Git invocations disable Git hooks and global/system config. These controls are defense in depth, not an OS sandbox. The fail-closed execution policy deliberately causes existing QA/debugger/command-based end-to-end tests to be marked strict expected failures; those workflows must be restored only using a verified isolated worker.
