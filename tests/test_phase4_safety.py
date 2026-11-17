@@ -61,3 +61,24 @@ def test_repository_discovery_filters_response_fields():
     result = api.accessible_repositories()
     assert result["repositories"][0]["default_branch"] == "develop"
     assert "sensitive_other_field" not in result["repositories"][0]
+
+
+def test_github_discovery_http_is_authenticated_and_uses_server_credential(tmp_path):
+    import threading
+    from integrations.api.server import create_api_server
+    from tests.test_phase3_security import TOKEN, request
+    db = Database(tmp_path / "discovery.db")
+    api = GitHubAPI("server-only-secret")
+    api._paged = lambda path: {"ok": True, "data": [{"full_name": "owner/repo", "private": True, "default_branch": "develop"}]}
+    server = create_api_server(db, port=0, api_token=TOKEN, github_service=GitHubExecutionService(db, api))
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        assert request(server, "/api/github/repositories")[0] == 401
+        status, payload = request(server, "/api/github/repositories", TOKEN)
+        assert status == 200 and payload["repositories"][0]["full_name"] == "owner/repo"
+        assert "server-only-secret" not in json.dumps(payload)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

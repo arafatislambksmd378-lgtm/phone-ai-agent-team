@@ -300,8 +300,8 @@ class ApiClient(var base: String, var token: String) {
       } catch (_: Exception) {
         JSONObject().put("error", "HTTP $code")
       }
-      if (code !in 200..299) {
-        val errMsg = parsed.optString("error").ifBlank { parsed.optString("message", "HTTP $code") }
+      if (code !in 200..299 || (parsed.has("ok") && !parsed.optBoolean("ok", false))) {
+        val errMsg = parsed.optString("error").ifBlank { parsed.optString("message").ifBlank { "Request failed (HTTP $code)" } }
         val isConflict = (code == 409) || parsed.optBoolean("conflict", false)
         val curSha = parsed.optString("current_sha", "")
         throw ApiException(code, errMsg, conflict = isConflict, currentSha = curSha)

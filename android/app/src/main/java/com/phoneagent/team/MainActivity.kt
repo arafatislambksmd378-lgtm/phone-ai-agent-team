@@ -84,7 +84,7 @@ class MainActivity : AppCompatActivity() {
     navRow.removeAllViews()
     val choices = listOf("Dashboard", "Projects", "Code", "Agents", "More")
     for (name in choices) {
-      val active = screen == name || (name == "More" && screen in listOf("Repository", "Changes", "Pull Requests", "Approvals", "Settings"))
+      val active = screen == name || (name == "More" && screen in listOf("Repository", "Changes", "Pull Requests", "Approvals", "Activity", "Telegram", "Settings"))
       val nav = TextView(this).apply {
         text = when (name) { "Dashboard" -> "⌂\nHome"; "Projects" -> "▧\nProjects"; "Code" -> "‹›\nCode"; "Agents" -> "✳\nAgents"; else -> "•••\nMore" }
         gravity = Gravity.CENTER; textSize = 11f; setTextColor(if (active) purple else muted)
@@ -92,8 +92,8 @@ class MainActivity : AppCompatActivity() {
         setOnClickListener {
           if (name != "More") navigate(name)
           else AlertDialog.Builder(this@MainActivity).setTitle("Workspace")
-            .setItems(arrayOf("Repository", "Changes", "Pull Requests", "Approvals", "Settings")) { _, index ->
-              navigate(listOf("Repository", "Changes", "Pull Requests", "Approvals", "Settings")[index])
+            .setItems(arrayOf("Repository", "Changes", "Pull Requests", "Approvals", "Activity", "Telegram", "Settings")) { _, index ->
+              navigate(listOf("Repository", "Changes", "Pull Requests", "Approvals", "Activity", "Telegram", "Settings")[index])
             }.show()
         }
       }
@@ -171,6 +171,8 @@ class MainActivity : AppCompatActivity() {
       "Pull Requests" -> pullRequests()
       "Agents" -> agents()
       "Approvals" -> approvals()
+      "Activity" -> activity()
+      "Telegram" -> telegram()
     }
   }
   private fun settings() {
@@ -313,6 +315,10 @@ class MainActivity : AppCompatActivity() {
     line("GitHub credentials stay on the backend. Select an accessible repository or enter its name.")
     val repo = input("owner/repository")
     button("Connect repository") { val value = repo.text.toString().trim(); if (value.isBlank()) { toast("Enter a repository name"); return@button }; bg({ api.connectRepository(projectId, value) }) { show("Repository") } }
+    button("Verify GitHub account") { bg({ api.githubAccount() }) { result ->
+      val user = result.optJSONObject("user") ?: JSONObject()
+      infoCard("SERVER GITHUB ACCOUNT", user.optString("login", "Unknown"), "Authenticated using the backend credential")
+    } }
     button("Browse accessible repositories") { bg({ api.githubRepositories() }) { result ->
       val repos = result.optJSONArray("repositories") ?: JSONArray()
       if (repos.length() == 0) { line("No accessible repositories were returned."); return@bg }
@@ -456,6 +462,32 @@ class MainActivity : AppCompatActivity() {
           "${agent.optInt("tasks_executing")} running  ·  ${agent.optInt("tasks_completed")} completed  ·  ${agent.optInt("tasks_failed")} failed")
       }
     }
+  }
+  private fun activity() {
+    header("Activity")
+    if (!requireProject()) return
+    line("Project $projectId · Shared backend history")
+    button("Refresh activity") { show("Activity") }
+    bg({ api.listSyncEvents(projectId, 60) }) { result ->
+      val events = result.optJSONArray("events") ?: JSONArray()
+      if (events.length() == 0) line("No activity has been recorded for this project.")
+      for (i in 0 until events.length()) {
+        val event = events.getJSONObject(i)
+        infoCard(event.optString("source"), event.optString("event").replace('_', ' '), event.optString("detail"))
+      }
+    }
+  }
+  private fun telegram() {
+    header("Telegram")
+    line("Telegram and Android can share projects and approvals when the backend runs both services together.")
+    bg({ api.health() }) { result ->
+      val attached = result.optBoolean("telegram_connected")
+      infoCard("BACKEND CONFIGURATION", if (attached) "Handler attached" else "Not attached",
+        "This is configuration status, not proof of live Telegram delivery.")
+    }
+    line("Bot credentials are configured on the server, never in this app. Ask your server administrator to configure the bot and permitted Telegram user, and run the shared backend in --with-api mode.")
+    button("Refresh status") { show("Telegram") }
+    button("View shared activity") { navigate("Activity") }
   }
   private fun approvals() {
     header("Approval Center")

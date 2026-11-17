@@ -35,8 +35,11 @@ jobs:
           ls -lh apk-out/
           test -n "$(ls -A apk-out)"
           for apk in apk-out/*.apk; do
-            echo "APK bytes: $(stat -c %s "$apk")"
-            sha256sum "$apk"
+            size=$(stat -c %s "$apk")
+            hash=$(sha256sum "$apk" | cut -d' ' -f1)
+            echo "APK bytes: $size"
+            echo "APK SHA-256: $hash"
+            echo "::notice title=APK metadata::bytes=$size sha256=$hash commit=$GITHUB_SHA"
           done
       - name: Upload build log
         if: always()
