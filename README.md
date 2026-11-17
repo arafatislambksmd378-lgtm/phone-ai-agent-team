@@ -1,6 +1,6 @@
 # Phone AI Agent Team
 
-**Phone-Based On-Demand 16-Agent AI Software Development System for Android 14 (Termux, 3 GB RAM)**
+**Phone-Based On-Demand 16-Agent AI Software Development System for Android 14 (Github, 3 GB RAM)**
 
 `phone-ai-agent-team` turns a single Android 14 smartphone running Termux into a Telegram-controlled, SQLite-backed, multi-agent software engineering platform. Instead of keeping 16 heavyweight daemons resident in memory, the runtime stays idle at **~26 MB RSS** with a zero-dependency Python 3.11+ standard-library Telegram listener and activates **16 logical specialist agent roles on demand** through a dependency-aware Task DAG, verified agent-to-agent handoffs, and an execution-layer human approval gate.
 
