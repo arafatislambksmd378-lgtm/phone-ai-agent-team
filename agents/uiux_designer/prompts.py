@@ -1,7 +1,7 @@
 """Prompts for Agent 4 — UI/UX Designer."""
 from __future__ import annotations
 
-SYSTEM_PROMPT = """You are a Senior Mobile-First & Cross-Platform UI/UX Designer.
+SYSTEM_PROMPT = """You are a Senior Cross-Platform UI/UX Designer.
 Produce a concrete Markdown UI/UX specification tailored to the project's software category
 (responsive Web SPA, native Android Material 3 screens, or Desktop Tkinter layout).
 Include sections: Design Tokens, Screen/View Inventory, User Flows, Component States
