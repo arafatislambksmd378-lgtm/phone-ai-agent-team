@@ -1,4 +1,4 @@
-"""Agent registry — maps agent_id -> class. Agents are logical workers invoked on demand."""
+"""Agent registry — maps agent_id -> logical Agent class with dependency injection."""
 from __future__ import annotations
 import importlib
 
@@ -40,16 +40,23 @@ AGENT_NAMES: dict[str, str] = {
     "workspace_executor": "Workspace & Tool Execution Agent",
 }
 
+
 class AgentRegistry:
-    def __init__(self, workspace: str = ".", ai_router=None, db=None, file_manager=None):
+    def __init__(self, workspace: str = ".", ai_router=None, db=None, file_manager=None,
+                 approval_manager=None, process_manager=None):
         self.workspace = workspace
         self.ai = ai_router
         self.db = db
         self.fm = file_manager
+        self.approval_manager = approval_manager
+        self.process_manager = process_manager
         self._cache: dict[str, object] = {}
 
     def list_agents(self) -> list[dict]:
         return [{"id": k, "name": v} for k, v in AGENT_NAMES.items()]
+
+    def describe_agents(self) -> list[dict]:
+        return [self.get(k).contract() for k in AGENT_MODULES]
 
     def get(self, agent_id: str):
         if agent_id in self._cache:
@@ -59,7 +66,14 @@ class AgentRegistry:
             raise KeyError(f"Unknown agent: {agent_id}")
         mod = importlib.import_module(mod_path)
         cls = getattr(mod, "Agent")
-        inst = cls(workspace=self.workspace, ai_router=self.ai, db=self.db, file_manager=self.fm)
+        inst = cls(
+            workspace=self.workspace,
+            ai_router=self.ai,
+            db=self.db,
+            file_manager=self.fm,
+            approval_manager=self.approval_manager,
+            process_manager=self.process_manager,
+        )
         self._cache[agent_id] = inst
         return inst
 

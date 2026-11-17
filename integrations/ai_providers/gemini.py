@@ -8,7 +8,8 @@ class GeminiAdapter(ProviderAdapter):
     supports_tools = False
     supports_json = True
 
-    def complete(self, system: str, user: str) -> dict:
+    def complete(self, system: str, user: str, *, max_tokens: int | None = None,
+                 temperature: float = 0.2) -> dict:
         if not self.available():
             return self._not_configured()
         if not self.model:
@@ -16,10 +17,11 @@ class GeminiAdapter(ProviderAdapter):
         # Key travels in a header, not the URL (URLs end up in logs/proxies).
         url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
                f"{self.model}:generateContent")
+        tokens = max(256, int(max_tokens or self.max_tokens))
         payload = {
             "systemInstruction": {"parts": [{"text": system}]},
             "contents": [{"role": "user", "parts": [{"text": user}]}],
-            "generationConfig": {"temperature": 0.3, "maxOutputTokens": 2048},
+            "generationConfig": {"temperature": float(temperature), "maxOutputTokens": tokens},
         }
         r = self._post_json(url, payload, headers={"x-goog-api-key": self.api_key})
         if not r.get("ok"):
