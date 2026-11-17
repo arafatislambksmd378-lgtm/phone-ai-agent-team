@@ -9,13 +9,15 @@ jobs:
         with: { distribution: temurin, java-version: '17' }
       - uses: gradle/actions/setup-gradle@v4
         with: { gradle-version: '8.9' }
-      - name: Accept Android SDK licenses
-        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+      - name: Install Android SDK 34
+        run: |
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-34" "build-tools;34.0.0"
       - name: Unit tests + assemble debug APK
-        run: cd android && gradle testDebugUnitTest assembleDebug --no-daemon --stacktrace
+        run: cd android && gradle testDebugUnitTest assembleDebug --no-daemon --stacktrace 2>&1 | tee ../android-build.log
       - uses: actions/upload-artifact@v4
         if: always()
-        with: { name: app-debug-apk, path: android/app/build/outputs/apk/debug/*.apk, if-no-files-found: warn }
+        with: { name: android-build-log, path: android-build.log }
       - uses: actions/upload-artifact@v4
-        if: failure()
-        with: { name: android-build-reports, path: android/app/build/reports/ }
+        if: success()
+        with: { name: app-debug-apk, path: android/app/build/outputs/apk/debug/*.apk }
