@@ -82,3 +82,6 @@ phone-ai-agent-team/
 | [`docs/PRODUCTION_READINESS.md`](docs/PRODUCTION_READINESS.md) | Honest verification matrix & operational readiness report |
 | [`docs/COMPREHENSIVE_AUDIT.md`](docs/COMPREHENSIVE_AUDIT.md) | Initial codebase audit findings (`AUD-01`–`AUD-14`) |
 | [`docs/REQUIREMENT_TRACEABILITY.md`](docs/REQUIREMENT_TRACEABILITY.md) | Requirement-to-module-to-test traceability matrix |
+
+## GitHub-Centric Platform (v3)
+Android app (`android/`, built by GitHub Actions — never on-device) + Telegram both use the shared JSON API: `API_AUTH_TOKEN=x python3 main.py --api --api-port 8000`. Each project binds its own GitHub repo (`POST /api/projects/{id}/repository`); agents work on `agent/<project>/<task>` branches and open PRs via `integrations/github/` — merges are approval-gated and cross-project repo access is rejected. Set `GITHUB_TOKEN` (fine-grained: Contents+Pull requests RW on selected repos); without it remote calls fail honestly, nothing is simulated. See `docs/architecture/` and `docs/implementation/`.
