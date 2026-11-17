@@ -20,6 +20,11 @@ class NavigationTest {
       onView(withText("Save and test")).check(matches(isDisplayed()))
       onView(withText("▧\nProjects")).perform(click())
       onView(withText("Create project")).check(matches(isDisplayed()))
+      it.recreate()
+      onView(withText("Your workspace")).check(matches(isDisplayed()))
+      onView(withText("•••\nMore")).perform(click())
+      onView(withText("Telegram")).perform(click())
+      onView(withText("Refresh status")).check(matches(isDisplayed()))
     }
   }
 }
