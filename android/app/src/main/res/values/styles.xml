@@ -1,0 +1,13 @@
+<resources>
+  <style name="Theme.PhoneAgent" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+    <item name="colorPrimary">#6441D3</item>
+    <item name="colorPrimaryVariant">#5232B4</item>
+    <item name="colorSecondary">#269C78</item>
+    <item name="android:fontFamily">sans</item>
+    <item name="android:statusBarColor">#FFFFFF</item>
+    <item name="android:windowLightStatusBar">true</item>
+    <item name="android:navigationBarColor">#FFFFFF</item>
+    <item name="android:windowLightNavigationBar">true</item>
+    <item name="android:windowBackground">#F8F7FC</item>
+  </style>
+</resources>

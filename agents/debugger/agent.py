@@ -196,6 +196,10 @@ class Agent(BaseAgent):
 
     def _run_pytest(self, targets: list[str]) -> tuple[bool, str]:
         self._require_tool("run_command")
+        # Do not run untrusted workspace code on the service host.
+        from execution.isolation import isolated_worker_available, BLOCKED_MESSAGE
+        if not isolated_worker_available():
+            return False, BLOCKED_MESSAGE
         cmd = [sys.executable, "-m", "pytest", "-q", *targets]
         env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "TMPDIR", "PREFIX", "PYTHONPATH")}
         env["PYTHONDONTWRITEBYTECODE"] = "1"

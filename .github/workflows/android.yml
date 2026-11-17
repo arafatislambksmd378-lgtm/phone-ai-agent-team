@@ -34,6 +34,10 @@ jobs:
           find . -name "*.apk" -exec cp {} apk-out/ \;
           ls -lh apk-out/
           test -n "$(ls -A apk-out)"
+          for apk in apk-out/*.apk; do
+            echo "APK bytes: $(stat -c %s "$apk")"
+            sha256sum "$apk"
+          done
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4

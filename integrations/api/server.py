@@ -385,6 +385,16 @@ def make_handler(
                     })
                 return self._send(200, payload)
 
+            # Account discovery uses the server-side GitHub credential; it never returns the token.
+            if parts in (["api", "github", "account"], ["api", "github", "repositories"]):
+                svc, gh_err = _require_github()
+                if gh_err:
+                    return self._send(*gh_err)
+                assert svc is not None
+                result = (svc.api.authenticated_user() if parts[-1] == "account"
+                          else svc.api.accessible_repositories())
+                return self._send(_http_status_from_result(result), result)
+
             # /api/agents
             if parts == ["api", "agents"]:
                 act = _agent_activity()

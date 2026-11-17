@@ -157,12 +157,37 @@ class GitHubAPI:
             for part in link.split(","):
                 if 'rel="next"' in part:
                     nxt = part.split(";")[0].strip().strip("<>")
-                    if nxt.startswith(self.base):
-                        url = nxt[len(self.base):]
+                    base_url = urllib.parse.urlsplit(self.base)
+                    next_url = urllib.parse.urlsplit(nxt)
+                    # Never forward the bearer token to a lookalike host or userinfo URL.
+                    if (next_url.scheme == base_url.scheme and next_url.netloc == base_url.netloc
+                            and not next_url.username and not next_url.password):
+                        url = urllib.parse.urlunsplit(("", "", next_url.path, next_url.query, ""))
                     break
         return {"ok": True, "status": 200, "data": items}
 
     # ---------- repository & permissions ----------
+    def authenticated_user(self) -> dict:
+        r = self._req("GET", "/user")
+        if not r.get("ok"):
+            return r
+        d = r.get("data") or {}
+        return {"ok": True, "status": 200, "user": {"login": d.get("login") or "",
+                "name": d.get("name") or "", "html_url": d.get("html_url") or ""}}
+
+    def accessible_repositories(self) -> dict:
+        r = self._paged("/user/repos?per_page=100&sort=updated&affiliation=owner%2Ccollaborator%2Corganization_member")
+        if not r.get("ok"):
+            return r
+        repos = []
+        for item in r.get("data") or []:
+            if not isinstance(item, dict):
+                continue
+            repos.append({"full_name": item.get("full_name") or "", "private": bool(item.get("private")),
+                          "default_branch": item.get("default_branch") or "",
+                          "permissions": item.get("permissions") or {}, "html_url": item.get("html_url") or ""})
+        return {"ok": True, "status": 200, "repositories": repos}
+
     def repo(self, full: str) -> dict:
         ok, enc = _encode_repo(full)
         if not ok:

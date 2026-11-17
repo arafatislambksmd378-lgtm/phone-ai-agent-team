@@ -53,6 +53,12 @@ class CommandRunner:
             elif not approved:
                 return {"ok": False, "error": "Requires human approval", "stdout": "", "stderr": "",
                         "needs_approval": True}
+        # A command allowlist and an approval do not isolate untrusted code or files.
+        # Fail closed until this call is delegated to a verified isolated worker.
+        from execution.isolation import isolated_worker_available, BLOCKED_MESSAGE
+        if not isolated_worker_available():
+            return {"ok": False, "blocked": True, "stdout": "", "stderr": "",
+                    "error": BLOCKED_MESSAGE}
         try:
             parts = shlex.split(command)
         except ValueError as e:

@@ -17,6 +17,7 @@ import javax.crypto.spec.GCMParameterSpec
  */
 class SecureStore(ctx: Context) {
   private val prefs = ctx.getSharedPreferences("phone_agent_secure", Context.MODE_PRIVATE)
+  private val legacyPrefs = ctx.getSharedPreferences("secure", Context.MODE_PRIVATE)
 
   private fun key(): SecretKey {
     val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -48,14 +49,17 @@ class SecureStore(ctx: Context) {
   }
 
   fun load(name: String, default: String = ""): String {
-    val raw = prefs.getString(name, null) ?: return default
+    val fromLegacy = !prefs.contains(name)
+    val raw = (if (fromLegacy) legacyPrefs else prefs).getString(name, null) ?: return default
     return try {
       val parts = raw.split(":", limit = 2)
       if (parts.size != 2) return default
       val cipher = Cipher.getInstance("AES/GCM/NoPadding")
       val spec = GCMParameterSpec(128, Base64.decode(parts[0], Base64.NO_WRAP))
       cipher.init(Cipher.DECRYPT_MODE, key(), spec)
-      String(cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)), Charsets.UTF_8)
+      val value = String(cipher.doFinal(Base64.decode(parts[1], Base64.DEFAULT)), Charsets.UTF_8)
+      if (fromLegacy) save(name, value)
+      value
     } catch (_: Exception) {
       default
     }

@@ -2,6 +2,13 @@ package com.phoneagent.team
 
 import android.app.AlertDialog
 import android.content.Intent
+import android.content.res.ColorStateList
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.view.Gravity
+import android.view.View
+import android.view.inputmethod.EditorInfo
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.text.Editable
@@ -26,28 +33,77 @@ class MainActivity : AppCompatActivity() {
   private var uploadCategory = ""
   private var screen = ""
   private var screenGeneration = 0
+  private lateinit var navRow: LinearLayout
+  private val purple = Color.rgb(100, 65, 211)
+  private val ink = Color.rgb(32, 29, 47)
+  private val muted = Color.rgb(108, 106, 121)
+  private val border = Color.rgb(232, 229, 240)
+  private val surface = Color.rgb(248, 247, 252)
+  private fun dp(v: Int): Int = (v * resources.displayMetrics.density + .5f).toInt()
+  private fun shape(color: Int, radius: Int = 14, stroke: Int = Color.TRANSPARENT) = GradientDrawable().apply {
+    setColor(color); cornerRadius = dp(radius).toFloat(); if (stroke != Color.TRANSPARENT) setStroke(dp(1), stroke)
+  }
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
     store = SecureStore(this)
     api = ApiClient(store.load("base"), store.load("token"))
     projectId = store.load("project")
-    val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-    status = TextView(this).apply { text = "Open Settings to connect"; setPadding(16, 8, 16, 8) }
-    val nav = HorizontalScrollView(this)
-    val row = LinearLayout(this)
-    listOf("Dashboard", "Projects", "Repository", "Code", "Changes", "Pull Requests", "Agents", "Approvals", "Settings").forEach { name ->
-      row.addView(Button(this).apply { text = name; setOnClickListener { navigate(name) } })
+    val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(surface) }
+    val top = LinearLayout(this).apply {
+      orientation = LinearLayout.VERTICAL; setBackgroundColor(Color.WHITE); setPadding(dp(20), dp(15), dp(20), dp(12))
     }
-    nav.addView(row); root.addView(nav); root.addView(status)
-    val scroll = ScrollView(this)
-    body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 16, 24, 16) }
-    scroll.addView(body); root.addView(scroll); setContentView(root)
-    show("Dashboard")
+    top.addView(TextView(this).apply { text = "AGENT  /  TEAM"; textSize = 13f; letterSpacing = .14f; setTextColor(purple); setTypeface(null, Typeface.BOLD) })
+    status = TextView(this).apply { text = "Set up a secure backend connection"; textSize = 12f; setTextColor(muted); setPadding(0, dp(5), 0, 0) }
+    top.addView(status); root.addView(top)
+    val scroll = ScrollView(this).apply { isFillViewport = true; isVerticalScrollBarEnabled = false }
+    body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(20), dp(20), dp(20), dp(28)) }
+    scroll.addView(body); root.addView(scroll, LinearLayout.LayoutParams(-1, 0, 1f))
+    navRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(Color.WHITE); setPadding(dp(6), dp(4), dp(6), dp(6)) }
+    root.addView(navRow); setContentView(root)
+    if (savedInstanceState != null && savedInstanceState.getString("editorPath") != null) {
+      val path = savedInstanceState.getString("editorPath") ?: ""
+      val current = savedInstanceState.getString("editorCurrent") ?: ""
+      if (savedInstanceState.getBoolean("editorNew")) browser.beginNewFile(path, current)
+      else { browser.openLoadedFile(path, savedInstanceState.getString("editorOriginal") ?: "", savedInstanceState.getString("editorSha") ?: ""); browser.updateEditorText(current) }
+      branch = savedInstanceState.getString("branch") ?: ""
+      show("Code")
+    } else show("Dashboard")
+  }
+
+  override fun onSaveInstanceState(outState: Bundle) {
+    if (browser.hasOpenFile) {
+      outState.putString("editorPath", browser.openPath); outState.putString("editorCurrent", browser.currentContent)
+      outState.putString("editorOriginal", browser.originalContent); outState.putString("editorSha", browser.openSha)
+      outState.putBoolean("editorNew", browser.isNewUnsavedFile); outState.putString("branch", branch)
+    }
+    super.onSaveInstanceState(outState)
+  }
+
+  private fun renderNavigation() {
+    navRow.removeAllViews()
+    val choices = listOf("Dashboard", "Projects", "Code", "Agents", "More")
+    for (name in choices) {
+      val active = screen == name || (name == "More" && screen in listOf("Repository", "Changes", "Pull Requests", "Approvals", "Settings"))
+      val nav = TextView(this).apply {
+        text = when (name) { "Dashboard" -> "⌂\nHome"; "Projects" -> "▧\nProjects"; "Code" -> "‹›\nCode"; "Agents" -> "✳\nAgents"; else -> "•••\nMore" }
+        gravity = Gravity.CENTER; textSize = 11f; setTextColor(if (active) purple else muted)
+        setTypeface(null, if (active) Typeface.BOLD else Typeface.NORMAL); minHeight = dp(56)
+        setOnClickListener {
+          if (name != "More") navigate(name)
+          else AlertDialog.Builder(this@MainActivity).setTitle("Workspace")
+            .setItems(arrayOf("Repository", "Changes", "Pull Requests", "Approvals", "Settings")) { _, index ->
+              navigate(listOf("Repository", "Changes", "Pull Requests", "Approvals", "Settings")[index])
+            }.show()
+        }
+      }
+      navRow.addView(nav, LinearLayout.LayoutParams(0, -2, 1f))
+    }
   }
 
   private fun bg(work: () -> JSONObject, done: (JSONObject) -> Unit) {
     val generation = screenGeneration
+    status.text = "Loading…"
     Thread {
       try {
         val result = work()
@@ -55,7 +111,7 @@ class MainActivity : AppCompatActivity() {
       } catch (e: Exception) {
         runOnUiThread {
           if (generation == screenGeneration) {
-            val note = if (e is ApiException && e.conflict) "Conflict: remote file changed. Your edits are preserved; reload only after copying them." else "Error: ${e.message}"
+            val note = if (e is ApiException && e.conflict) "Conflict: remote file changed. Your edits are preserved; reload only after copying them." else "Unavailable: ${e.message}"
             status.text = note; toast(note)
           }
         }
@@ -63,10 +119,35 @@ class MainActivity : AppCompatActivity() {
     }.start()
   }
   private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
-  private fun header(title: String) { body.removeAllViews(); body.addView(TextView(this).apply { text = title; textSize = 20f }) }
-  private fun line(text: String) { body.addView(TextView(this).apply { this.text = text; textSize = 15f }) }
-  private fun input(hint: String, value: String = "") = EditText(this).apply { this.hint = hint; setText(value) }.also { body.addView(it) }
-  private fun button(label: String, action: () -> Unit) { body.addView(Button(this).apply { text = label; setOnClickListener { action() } }) }
+  private fun header(title: String) {
+    body.removeAllViews()
+    body.addView(TextView(this).apply { text = title; textSize = 27f; setTextColor(ink); setTypeface(null, Typeface.BOLD); setPadding(0, 0, 0, dp(12)) })
+  }
+  private fun line(text: String) { body.addView(TextView(this).apply { this.text = text; textSize = 14f; setTextColor(muted); setPadding(0, dp(7), 0, dp(7)) }) }
+  private fun input(hint: String, value: String = "") = EditText(this).apply {
+    this.hint = hint; setText(value); textSize = 15f; setTextColor(ink); setHintTextColor(muted)
+    background = shape(Color.WHITE, 14, border); setPadding(dp(16), dp(12), dp(16), dp(12)); minHeight = dp(52)
+    layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(5), 0, dp(7)) }
+  }.also { body.addView(it) }
+  private fun button(label: String, action: () -> Unit) {
+    body.addView(Button(this).apply {
+      text = label; isAllCaps = false; textSize = 14f; setTextColor(purple); setTypeface(null, Typeface.BOLD)
+      backgroundTintList = ColorStateList.valueOf(Color.rgb(240, 236, 255)); background = shape(Color.rgb(240, 236, 255))
+      minHeight = dp(50); elevation = 0f
+      layoutParams = LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(4), 0, dp(5)) }
+      setOnClickListener { action() }
+    })
+  }
+  private fun section(title: String) { body.addView(TextView(this).apply {
+    text = title; textSize = 17f; setTextColor(ink); setTypeface(null, Typeface.BOLD); setPadding(0, dp(20), 0, dp(8))
+  }) }
+  private fun infoCard(title: String, value: String, note: String = "") {
+    val card = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; background = shape(Color.WHITE, 16, border); setPadding(dp(16), dp(14), dp(16), dp(14)) }
+    card.addView(TextView(this).apply { text = title; textSize = 12f; setTextColor(muted) })
+    card.addView(TextView(this).apply { text = value; textSize = 20f; setTextColor(ink); setTypeface(null, Typeface.BOLD); setPadding(0, dp(4), 0, 0) })
+    if (note.isNotBlank()) card.addView(TextView(this).apply { text = note; textSize = 12f; setTextColor(muted); setPadding(0, dp(5), 0, 0) })
+    body.addView(card, LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(4), 0, dp(6)) })
+  }
   private fun requireProject(): Boolean { if (projectId.isBlank()) { toast("Select a project first"); return false }; return true }
   private fun guard(action: () -> Unit) {
     if (!browser.isDirty) { action(); return }
@@ -79,7 +160,7 @@ class MainActivity : AppCompatActivity() {
   override fun onBackPressed() { if (screen == "Code") guard { show("Dashboard") } else super.onBackPressed() }
 
   private fun show(target: String) {
-    screen = target; screenGeneration++
+    screen = target; screenGeneration++; renderNavigation()
     when (target) {
       "Settings" -> settings()
       "Dashboard" -> dashboard()
@@ -104,7 +185,7 @@ class MainActivity : AppCompatActivity() {
   private fun projects() {
     header("Projects")
     val name = input("New project name")
-    button("Create project") { bg({ api.createProject(name.text.toString(), autoStart = false) }) { r ->
+    button("Create project") { val projectName = name.text.toString().trim(); if (projectName.isBlank()) { toast("Enter a project name"); return@button }; bg({ api.createProject(projectName, autoStart = false) }) { r ->
       projectId = r.optString("id"); store.save("project", projectId); branch = ""; defaultBranch = ""; browser = FileBrowserState(); directoryLoaded = false; show("Dashboard")
     } }
     bg({ api.listProjects() }) { r ->
@@ -118,20 +199,50 @@ class MainActivity : AppCompatActivity() {
     }
   }
   private fun dashboard() {
-    header("Dashboard")
-    if (!requireProject()) return
-    line("Project: $projectId")
+    header("Your workspace")
+    line("A clear view of your projects, agents and approvals.")
+    val overview = TextView(this).apply {
+      text = "Loading workspace overview…"; textSize = 15f; setTextColor(ink)
+      background = shape(Color.WHITE, 16, border); setPadding(dp(16), dp(16), dp(16), dp(16))
+    }
+    body.addView(overview, LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(8), 0, dp(8)) })
+    bg({
+      val projects = api.listProjects(); val agents = api.listAgents(); val health = api.health()
+      JSONObject().put("projects", projects.optJSONArray("projects") ?: JSONArray())
+        .put("agents", agents.optJSONArray("agents") ?: JSONArray()).put("health", health)
+    }) { result ->
+      val projects = result.optJSONArray("projects") ?: JSONArray(); val agents = result.optJSONArray("agents") ?: JSONArray()
+      var repos = 0; var pending = 0; var running = 0; var completed = 0; var failed = 0; var active = 0
+      for (i in 0 until projects.length()) {
+        val p = projects.getJSONObject(i); if (p.optJSONObject("repository") != null) repos++
+        pending += p.optInt("pending_approvals_count"); val c = p.optJSONObject("task_counts") ?: JSONObject()
+        running += c.optInt("executing"); completed += c.optInt("completed"); failed += c.optInt("failed")
+      }
+      for (i in 0 until agents.length()) if (agents.getJSONObject(i).optString("status") == "RUNNING") active++
+      val health = result.optJSONObject("health") ?: JSONObject()
+      overview.text = "${projects.length()} projects  ·  $repos repositories\n$active active agents  ·  $running running tasks\n$completed completed  ·  $failed failed  ·  $pending pending approvals\n\nBackend connected  ·  Telegram ${if (health.optBoolean("telegram_connected")) "handler configured" else "not configured"}"
+    }
+    section("Quick actions")
+    button("Create or select project") { navigate("Projects") }
+    button("Connect GitHub repository") { navigate("Repository") }
+    button("View agents") { navigate("Agents") }
+    button("Open approvals") { navigate("Approvals") }
+    if (projectId.isBlank()) { section("Get started"); line("Select a project to submit instructions, upload files, and view task history."); return }
+    section("Selected project")
+    line("Project ID: $projectId")
+    line("Test and command execution is blocked until a secure isolated worker is available; tasks that require it may fail.")
     val instruction = input("Describe the development task or blueprint").apply { minLines = 4 }
     button("Submit blueprint / instructions") {
-      val text = instruction.text.toString()
+      val text = instruction.text.toString().trim()
+      if (text.isBlank()) { toast("Enter an instruction first"); return@button }
       bg({ api.submitInstruction(projectId, text) }) { line("Submitted: $it") }
     }
     button("Run GitHub execution") {
       val text = instruction.text.toString()
       AlertDialog.Builder(this).setTitle("Run agent execution?")
-        .setMessage("This may create commits and a pull request in the connected repository. Project tests require an isolated, explicitly enabled backend.")
+        .setMessage("This workflow is currently blocked until repository context and an isolated worker are available. No files will be published.")
         .setNegativeButton("Cancel", null).setPositiveButton("Run") { _, _ ->
-          bg({ api.submitInstruction(projectId, text, mode = "github_execute") }) { line("GitHub job: $it") }
+          bg({ api.submitInstruction(projectId, text, mode = "github_execute", asyncExec = false) }) { line("GitHub job: $it") }
         }.show()
     }
     button("Upload blueprint") { pickFile("blueprint") }
@@ -153,7 +264,20 @@ class MainActivity : AppCompatActivity() {
         }
       }
     }
-    bg({ api.listProjectLogs(projectId) }) { r -> line("Recent logs: ${r.optJSONArray("logs") ?: JSONArray()}") }
+    bg({ api.listSyncEvents(projectId) }) { r ->
+      section("Recent activity")
+      val events = r.optJSONArray("events") ?: JSONArray()
+      if (events.length() == 0) line("No activity yet.")
+      for (i in 0 until minOf(events.length(), 8)) {
+        val e = events.getJSONObject(i); line("${e.optString("event").replace('_', ' ')} · ${e.optString("source")}\n${e.optString("detail")}")
+      }
+    }
+    bg({ api.listProjectLogs(projectId) }) { r ->
+      section("Execution logs")
+      val logs = r.optJSONArray("logs") ?: JSONArray()
+      if (logs.length() == 0) line("No logs yet.")
+      for (i in 0 until minOf(logs.length(), 10)) { val item = logs.getJSONObject(i); line(item.optString("message", item.toString())) }
+    }
   }
   private fun pickFile(category: String) {
     uploadCategory = category
@@ -186,8 +310,15 @@ class MainActivity : AppCompatActivity() {
   private fun repository() {
     header("Repository")
     if (!requireProject()) return
+    line("GitHub credentials stay on the backend. Select an accessible repository or enter its name.")
     val repo = input("owner/repository")
-    button("Connect repository") { val value = repo.text.toString(); bg({ api.connectRepository(projectId, value) }) { show("Repository") } }
+    button("Connect repository") { val value = repo.text.toString().trim(); if (value.isBlank()) { toast("Enter a repository name"); return@button }; bg({ api.connectRepository(projectId, value) }) { show("Repository") } }
+    button("Browse accessible repositories") { bg({ api.githubRepositories() }) { result ->
+      val repos = result.optJSONArray("repositories") ?: JSONArray()
+      if (repos.length() == 0) { line("No accessible repositories were returned."); return@bg }
+      val names = Array(repos.length()) { i -> repos.getJSONObject(i).optString("full_name") }
+      AlertDialog.Builder(this).setTitle("Select a repository").setItems(names) { _, i -> repo.setText(names[i]) }.setNegativeButton("Cancel", null).show()
+    } }
     button("Refresh repository metadata") { bg({ api.refreshRepository(projectId) }) { show("Repository") } }
     val newBranch = input("New working branch")
     button("Create branch from default") { val value = newBranch.text.toString(); bg({ api.createBranch(projectId, value) }) { show("Repository") } }
@@ -232,16 +363,16 @@ class MainActivity : AppCompatActivity() {
       if (!isNew && sha.isNullOrBlank()) { toast("Missing remote SHA; reload before saving"); return@button }
       bg({ if (isNew) api.createFile(projectId, path, content, activeBranch, "Create $path") else api.saveFile(projectId, path, content, sha!!, activeBranch, "Update $path") }) { r ->
         val newSha = r.optString("sha")
-        if (newSha.isBlank()) { toast("Saved but no SHA returned; reload before further edits"); browser.closeFile(); listDir(browser.currentDir) }
+        if (newSha.isBlank()) { toast("Save succeeded but no SHA was returned. Your editor text is preserved; copy it before reloading."); status.text = "Reload required — editor preserved" }
         else { val latest = browser.currentContent; browser.markSaved(path, newSha, content); browser.updateEditorText(latest); code() }
       }
     }
     val rename = input("Rename to path")
-    button("Rename") { guard {
+    button("Rename") {
       val old = browser.openPath; val sha = browser.openSha; val next = rename.text.toString()
-      if (old.isBlank() || sha.isNullOrBlank()) { toast("Open a saved file first"); return@guard }
-      bg({ api.renameFile(projectId, old, next, sha, branch, "Rename $old") }) { browser.closeFile(); listDir(browser.currentDir) }
-    } }
+      if (old.isBlank() || sha.isNullOrBlank()) { toast("Open a saved file first"); return@button }
+      guard { bg({ api.renameFile(projectId, old, next, sha, branch, "Rename $old") }) { browser.closeFile(); listDir(browser.currentDir) } }
+    }
     button("Delete") {
       val path = browser.openPath; val sha = browser.openSha
       if (sha.isNullOrBlank()) { toast("Open a saved file first"); return@button }
@@ -295,12 +426,36 @@ class MainActivity : AppCompatActivity() {
           }.show()
       }
     }
-    bg({ api.listPrFiles(projectId, number) }) { line("Changed files and diffs: ${it.toString(2)}") }
+    bg({ api.listPrFiles(projectId, number) }) { r ->
+      section("Changed files")
+      val files = r.optJSONArray("files") ?: JSONArray()
+      if (files.length() == 0) line("No changed files reported.")
+      for (i in 0 until files.length()) {
+        val f = files.getJSONObject(i)
+        infoCard(f.optString("status"), f.optString("filename"), "+${f.optInt("additions")}  −${f.optInt("deletions")}")
+        val lines = f.optJSONArray("lines") ?: JSONArray()
+        if (lines.length() == 0) line("Patch not available (binary or omitted by GitHub).")
+        for (j in 0 until minOf(lines.length(), 250)) {
+          val diff = lines.getJSONObject(j)
+          body.addView(TextView(this).apply { text = diff.optString("text"); textSize = 12f; typeface = Typeface.MONOSPACE
+            setTextColor(when (diff.optString("kind")) { "add" -> Color.rgb(25, 120, 86); "del" -> Color.rgb(171, 55, 72); "hunk" -> purple; else -> ink }) })
+        }
+        if (lines.length() > 250) line("Diff truncated in app; review the full patch on GitHub.")
+      }
+    }
   }
   private fun agents() {
     header("Agent activity")
     button("Refresh") { show("Agents") }
-    bg({ api.listAgents() }) { r -> val a = r.optJSONArray("agents") ?: JSONArray(); for (i in 0 until a.length()) line(a.getJSONObject(i).toString()) }
+    bg({ api.listAgents() }) { r ->
+      val a = r.optJSONArray("agents") ?: JSONArray()
+      if (a.length() == 0) line("No agent status available.")
+      for (i in 0 until a.length()) {
+        val agent = a.getJSONObject(i)
+        infoCard(agent.optString("status"), agent.optString("name"),
+          "${agent.optInt("tasks_executing")} running  ·  ${agent.optInt("tasks_completed")} completed  ·  ${agent.optInt("tasks_failed")} failed")
+      }
+    }
   }
   private fun approvals() {
     header("Approval Center")

@@ -28,6 +28,8 @@ class ApiClient(var base: String, var token: String) {
   // ---- System & Monitoring ----
   fun health(): JSONObject = get("/api/health")
   fun listAgents(): JSONObject = get("/api/agents")
+  fun githubAccount(): JSONObject = get("/api/github/account")
+  fun githubRepositories(): JSONObject = get("/api/github/repositories")
   fun listApprovals(projectId: String? = null, status: String = "PENDING"): JSONObject =
     get("/api/approvals" + UrlSecurity.buildQuery(listOf("project_id" to projectId, "status" to status)))
   fun listApprovalAudit(projectId: String? = null): JSONObject =

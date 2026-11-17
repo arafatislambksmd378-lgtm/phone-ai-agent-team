@@ -1024,6 +1024,13 @@ class GitHubExecutionService:
         if not clean_instruction:
             return {"ok": False, "status": 400, "error": "Development instruction is required"}
 
+        # This pipeline does not yet import a bounded repository snapshot or run in
+        # an isolated worker. Refuse before starting agents or writing remote files.
+        from execution.isolation import isolated_worker_available
+        if not isolated_worker_available():
+            return {"ok": False, "status": 503, "blocked": True,
+                    "error": "GitHub agent execution is unavailable until repository-context handling and isolated workers are implemented"}
+
         prefix = (target_prefix or "").strip().strip("/")
         if prefix:
             ok_pref, pref_err = validate_repo_path(prefix, allow_empty=False)
@@ -1221,9 +1228,10 @@ class GitHubExecutionService:
     def _run_workspace_pytest(workspace: Path) -> dict:
         # pytest executes arbitrary project code. Environment scrubbing is not a sandbox.
         # Require an operator to opt in only in a disposable, isolated environment.
-        if os.environ.get("ALLOW_UNSANDBOXED_PROJECT_TESTS") != "1":
+        from execution.isolation import isolated_worker_available, BLOCKED_MESSAGE
+        if not isolated_worker_available():
             return {"executed": False, "passed": False, "returncode": None,
-                    "summary": "Project test execution disabled: requires isolated environment and explicit opt-in", "output": ""}
+                    "summary": BLOCKED_MESSAGE, "output": ""}
         tests_dir = workspace / "tests"
         if not tests_dir.is_dir() or not list(tests_dir.glob("test_*.py")):
             return {"executed": False, "passed": False, "returncode": None, "summary": "No test_*.py files found", "output": ""}

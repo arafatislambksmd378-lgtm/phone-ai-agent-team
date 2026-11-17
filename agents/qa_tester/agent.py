@@ -320,6 +320,10 @@ class Agent(BaseAgent):
 
     def _run_pytest(self, test_rel: str) -> tuple[bool, str, str]:
         self._require_tool("run_command")
+        # Project tests execute arbitrary code. No verified isolated worker is wired yet.
+        from execution.isolation import isolated_worker_available, BLOCKED_MESSAGE
+        if not isolated_worker_available():
+            return False, "BLOCKED", BLOCKED_MESSAGE
         target = "tests" if self._exists("tests") else test_rel
         cmd = [sys.executable, "-m", "pytest", "-q", target]
         try:
