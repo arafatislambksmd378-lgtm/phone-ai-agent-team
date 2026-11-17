@@ -8,7 +8,15 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+V4_SCHEMA = """
+CREATE TABLE IF NOT EXISTS github_connections (id TEXT PRIMARY KEY, owner TEXT NOT NULL DEFAULT '', scopes TEXT NOT NULL DEFAULT '', token_ref TEXT NOT NULL DEFAULT 'env:GITHUB_TOKEN', status TEXT NOT NULL DEFAULT 'DISCONNECTED', created_at REAL NOT NULL, updated_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS project_repositories (project_id TEXT PRIMARY KEY REFERENCES projects(id), repo_full_name TEXT NOT NULL, owner TEXT NOT NULL, name TEXT NOT NULL, visibility TEXT NOT NULL DEFAULT 'private', default_branch TEXT NOT NULL DEFAULT 'main', working_branch TEXT, connected_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS pull_requests (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, repo_full_name TEXT NOT NULL, number INTEGER, title TEXT NOT NULL, head_branch TEXT NOT NULL, base_branch TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'OPEN', url TEXT NOT NULL DEFAULT '', task_id TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS uploaded_artifacts (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, filename TEXT NOT NULL, sha256 TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT 'dashboard', created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS synchronization_events (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL DEFAULT '', source TEXT NOT NULL, event TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', ts REAL NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_pr_project ON pull_requests(project_id);
+"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS projects (
@@ -106,6 +114,9 @@ class Database:
     def migrate(self) -> None:
         with self._lock:
             self._conn.executescript(SCHEMA)
+            self._conn.executescript(V4_SCHEMA)  # v4: additive, preserves all v3 data
+            if "description" not in {r["name"] for r in self._conn.execute("PRAGMA table_info(projects)")}:
+                self._conn.execute("ALTER TABLE projects ADD COLUMN description TEXT NOT NULL DEFAULT ''")
             proj_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(projects)").fetchall()}
             if "lifecycle" not in proj_cols:
                 self._conn.execute("ALTER TABLE projects ADD COLUMN lifecycle TEXT NOT NULL DEFAULT 'IDLE'")
@@ -599,3 +610,22 @@ class Database:
                 self._conn.close()
             except Exception:
                 pass
+
+    # ---- v4: multi-project GitHub bindings (isolation enforced here) ----
+    def bind_repository(self, project_id, repo_full_name, visibility="private", default_branch="main", working_branch=None):
+        parts = (repo_full_name or "").strip().split("/")
+        if len(parts) != 2 or not all(parts): raise ValueError("repo must be owner/name")
+        self.execute("INSERT INTO project_repositories(project_id,repo_full_name,owner,name,visibility,default_branch,working_branch,connected_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET repo_full_name=excluded.repo_full_name,owner=excluded.owner,name=excluded.name,visibility=excluded.visibility,default_branch=excluded.default_branch,working_branch=excluded.working_branch", (project_id, repo_full_name, parts[0], parts[1], visibility, default_branch, working_branch, time.time()))
+        self.record_sync(project_id, "system", "repo_bound", repo_full_name)
+        return self.get_repository(project_id)
+    def get_repository(self, project_id): return self.query_one("SELECT * FROM project_repositories WHERE project_id=?", (project_id,))
+    def assert_repo(self, project_id, repo_full_name):
+        b = self.get_repository(project_id)
+        if not b: raise PermissionError("No GitHub repository connected to this project")
+        if b["repo_full_name"] != repo_full_name: raise PermissionError(f"Repository isolation violation: project bound to {b['repo_full_name']}")
+        return b
+    def record_pull_request(self, project_id, repo, number, title, head, base, url="", task_id=None, state="OPEN"):
+        pid = f"pr_{uuid.uuid4().hex[:12]}"; now=time.time()
+        self.execute("INSERT INTO pull_requests(id,project_id,repo_full_name,number,title,head_branch,base_branch,state,url,task_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (pid,project_id,repo,number,title,head,base,state,url,task_id,now,now)); return pid
+    def list_pull_requests(self, project_id): return self.query("SELECT * FROM pull_requests WHERE project_id=? ORDER BY created_at DESC", (project_id,))
+    def record_sync(self, project_id, source, event, detail=""): self.execute("INSERT INTO synchronization_events(project_id,source,event,detail,ts) VALUES(?,?,?,?,?)", (project_id,source,event,detail,time.time()))

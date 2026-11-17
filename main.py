@@ -164,6 +164,8 @@ def _remove_pid() -> None:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Phone AI Agent Team")
     ap.add_argument("--web", action="store_true", help="launch API Key & Live Verification web page")
+    ap.add_argument("--api", action="store_true", help="serve shared Android/Telegram JSON API")
+    ap.add_argument("--api-port", type=int, default=8000)
     ap.add_argument("--host", default="0.0.0.0", help="with --web: bind host (default 0.0.0.0)")
     ap.add_argument("--port", type=int, default=int(os.getenv("WEB_SETUP_PORT", "8080")),
                     help="with --web: bind port (default 8080)")
@@ -175,6 +177,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--recover", action="store_true")
     ap.add_argument("--selfcheck", action="store_true")
     args = ap.parse_args(argv)
+    if getattr(args, "api", False):
+        from config.settings import Settings as _S
+        from memory.database import Database as _D
+        from integrations.api.server import serve as _serve
+        _s = _S(); _serve(_D(_s.db_path), port=args.api_port, api_token=__import__("os").getenv("API_AUTH_TOKEN", "")); return 0
 
     settings = get_settings()
     settings.ensure_dirs()

@@ -1,0 +1,2 @@
+# Feature Preservation Matrix
+All 35 listed capabilities preserved: 16 agents, orchestrator, dynamic selection, DAG, router, handoffs, SQLite queue, memory, approvals, ZIP/doc, security validation, recovery, logging, test execution, git checkpoints → unchanged modules; GitHub backup → extended to per-project REST PR workflow; Termux execution → demoted to optional local worker, GitHub branch execution is primary; Telegram → unchanged, shared backend; web setup portal → kept, plus new API/Android dashboard. Nothing removed.

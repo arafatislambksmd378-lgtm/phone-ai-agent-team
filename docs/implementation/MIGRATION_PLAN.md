@@ -1,0 +1,2 @@
+# Migration Plan
+DB v3→v4 is additive only (new tables + nullable project columns), idempotent `CREATE TABLE IF NOT EXISTS`, recorded in `migrations`; v3 backups restore unchanged. Code migration is additive: new `integrations/github/api.py`, `executor.py`, `integrations/api/`, `android/`; existing engine/telegram/agents untouched except settings additions. Rollback: checkout backup branch or revert this PR; no data destruction.
