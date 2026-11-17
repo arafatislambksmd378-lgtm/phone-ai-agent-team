@@ -17,10 +17,17 @@ jobs:
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null 2>&1 || true
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-34" "build-tools;34.0.0"
       - name: Unit tests + assemble debug APK
+        continue-on-error: true
         run: |
           cd android
           set -o pipefail
-          gradle testDebugUnitTest assembleDebug --no-daemon --stacktrace 2>&1 | tee ../android-build.log
+          gradle testDebugUnitTest assembleDebug --no-daemon 2>&1 | tee ../android-build.log
+      - name: Surface build errors
+        if: always()
+        run: |
+          MSG=$(grep -E "e: |error:|FAILED|What went wrong|Could not|Unresolved reference" android-build.log | head -8 | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')
+          echo "::error::${MSG:-no error lines matched}"
+          grep -q "BUILD SUCCESSFUL" android-build.log
       - name: Locate and stage APK
         run: |
           echo "::warning::$(grep -E 'BUILD (SUCCESSFUL|FAILED)' android-build.log | head -1)"
