@@ -1,116 +1,316 @@
 package com.phoneagent.team
+
 import android.app.AlertDialog
-import android.graphics.Color
+import android.content.Intent
 import android.os.Bundle
+import android.provider.OpenableColumns
 import android.text.Editable
 import android.text.TextWatcher
+import android.util.Base64
 import android.widget.*
 import androidx.appcompat.app.AppCompatActivity
 import org.json.JSONArray
 import org.json.JSONObject
 
-/** Real workspace: every screen calls the shared Orchestrator API (same DB as Telegram).
-    GitHub writes go through the backend executor, which enforces repo isolation,
-    stale-SHA conflict detection and approval gates. No GitHub token ever reaches this app. */
+/** Dashboard and repository operations share the authenticated backend used by Telegram. */
 class MainActivity : AppCompatActivity() {
   private lateinit var store: SecureStore
   private lateinit var api: ApiClient
   private lateinit var body: LinearLayout
   private lateinit var status: TextView
-  private var projectId: String = ""
-  private var branch: String = "main"
-  private var filePath: String = ""
-  private var fileSha: String? = null
-  private var dirty: Boolean = false
+  private var projectId = ""
+  private var branch = ""
+  private var defaultBranch = ""
+  private var browser = FileBrowserState()
+  private var directoryLoaded = false
+  private var uploadCategory = ""
+  private var screen = ""
+  private var screenGeneration = 0
 
-  override fun onCreate(s: Bundle?) {
-    super.onCreate(s)
+  override fun onCreate(savedInstanceState: Bundle?) {
+    super.onCreate(savedInstanceState)
     store = SecureStore(this)
-    api = ApiClient(store.load("base", ""), store.load("token", ""))
-    projectId = store.load("project", "")
+    api = ApiClient(store.load("base"), store.load("token"))
+    projectId = store.load("project")
     val root = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-    status = TextView(this).apply { text = "Not connected — open Settings"; setPadding(16, 8, 16, 8) }
-    val nav = HorizontalScrollView(this); val row = LinearLayout(this)
-    listOf("Dashboard", "Projects", "Repository", "Code", "Changes", "Agents", "Approvals", "Settings").forEach { name ->
-      row.addView(Button(this).apply { text = name; setOnClickListener { show(name) } })
+    status = TextView(this).apply { text = "Open Settings to connect"; setPadding(16, 8, 16, 8) }
+    val nav = HorizontalScrollView(this)
+    val row = LinearLayout(this)
+    listOf("Dashboard", "Projects", "Repository", "Code", "Changes", "Pull Requests", "Agents", "Approvals", "Settings").forEach { name ->
+      row.addView(Button(this).apply { text = name; setOnClickListener { navigate(name) } })
     }
     nav.addView(row); root.addView(nav); root.addView(status)
-    val scroll = ScrollView(this); body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 16, 24, 16) }
+    val scroll = ScrollView(this)
+    body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(24, 16, 24, 16) }
     scroll.addView(body); root.addView(scroll); setContentView(root)
     show("Dashboard")
   }
 
   private fun bg(work: () -> JSONObject, done: (JSONObject) -> Unit) {
-    Thread { try { val r = work(); runOnUiThread { status.text = "Connected"; done(r) } }
-      catch (e: Exception) { runOnUiThread { status.text = "Error: ${e.message}"; toast("Failed: ${e.message}") } } }.start()
+    val generation = screenGeneration
+    Thread {
+      try {
+        val result = work()
+        runOnUiThread { if (generation == screenGeneration) { status.text = "Connected"; done(result) } }
+      } catch (e: Exception) {
+        runOnUiThread {
+          if (generation == screenGeneration) {
+            val note = if (e is ApiException && e.conflict) "Conflict: remote file changed. Your edits are preserved; reload only after copying them." else "Error: ${e.message}"
+            status.text = note; toast(note)
+          }
+        }
+      }
+    }.start()
   }
-  private fun toast(m: String?) = Toast.makeText(this, m ?: "error", Toast.LENGTH_LONG).show()
-  private fun header(t: String) { body.removeAllViews(); body.addView(TextView(this).apply { text = t; textSize = 20f }) }
-  private fun line(t: String) = body.addView(TextView(this).apply { text = t; textSize = 15f })
+  private fun toast(message: String) = Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+  private fun header(title: String) { body.removeAllViews(); body.addView(TextView(this).apply { text = title; textSize = 20f }) }
+  private fun line(text: String) { body.addView(TextView(this).apply { this.text = text; textSize = 15f }) }
   private fun input(hint: String, value: String = "") = EditText(this).apply { this.hint = hint; setText(value) }.also { body.addView(it) }
-  private fun btn(label: String, fn: () -> Unit) = body.addView(Button(this).apply { text = label; setOnClickListener { fn() } })
-  private fun needProject(): Boolean { if (projectId.isBlank()) { toast("Select a project first (Projects)"); return false }; return true }
+  private fun button(label: String, action: () -> Unit) { body.addView(Button(this).apply { text = label; setOnClickListener { action() } }) }
+  private fun requireProject(): Boolean { if (projectId.isBlank()) { toast("Select a project first"); return false }; return true }
+  private fun guard(action: () -> Unit) {
+    if (!browser.isDirty) { action(); return }
+    AlertDialog.Builder(this).setTitle("Discard unsaved changes?")
+      .setMessage("Your edits to ${browser.openPath} have not been saved.")
+      .setNegativeButton("Keep editing", null)
+      .setPositiveButton("Discard") { _, _ -> browser.closeFile(); action() }.show()
+  }
+  private fun navigate(target: String) { if (screen == "Code") guard { show(target) } else show(target) }
+  override fun onBackPressed() { if (screen == "Code") guard { show("Dashboard") } else super.onBackPressed() }
 
-  private fun show(screen: String) {
-    when (screen) {
-      "Settings" -> { header("Settings"); val b = input("Backend URL (https://…)", api.base); val t = input("API token", api.token)
-        btn("Save & test connection") { store.save("base", b.text.toString()); store.save("token", t.text.toString())
-          api = ApiClient(b.text.toString(), t.text.toString()); bg({ api.get("/api/health") }) { line("Health: $it") } } }
-      "Dashboard" -> { header("Dashboard"); line("Project: $projectId  Branch: $branch")
-        bg({ api.get("/api/projects") }) { r -> val ps = r.optJSONArray("projects") ?: JSONArray(); line("Projects: ${ps.length()}")
-          bg({ api.get("/api/approvals") }) { a -> line("Pending approvals: ${(a.optJSONArray("approvals") ?: JSONArray()).length()}") } } }
-      "Projects" -> { header("Projects"); val name = input("New project name")
-        btn("Create project") { bg({ api.post("/api/projects", JSONObject().put("name", name.text.toString())) }) { r ->
-          projectId = r.optString("id"); store.save("project", projectId); line("Created & selected: $projectId") } }
-        bg({ api.get("/api/projects") }) { r -> val ps = r.optJSONArray("projects") ?: JSONArray()
-          for (i in 0 until ps.length()) { val p = ps.getJSONObject(i)
-            btn("${p.optString("name")} — ${p.optString("status")}") { projectId = p.optString("id"); store.save("project", projectId); toast("Selected $projectId") } } } }
-      "Repository" -> { if (!needProject()) return; header("Repository ($projectId)")
-        val repo = input("owner/repository"); btn("Connect repository") {
-          bg({ api.post("/api/projects/$projectId/repository", JSONObject().put("repo", repo.text.toString())) }) { line("Connected: $it") } }
-        btn("Branches") { bg({ api.get("/api/projects/$projectId/branches") }) { r -> val d = r.optJSONArray("data") ?: JSONArray()
-          for (i in 0 until d.length()) { val n = d.getJSONObject(i).optString("name"); btn("Branch: $n") { branch = n; toast("Branch $n") } } } }
-        btn("Commit history") { bg({ api.get("/api/projects/$projectId/commits?branch=$branch") }) { r -> val d = r.optJSONArray("data") ?: JSONArray()
-          for (i in 0 until minOf(d.length(), 30)) { val c = d.getJSONObject(i); line("${c.optString("sha").take(7)} ${c.optJSONObject("commit")?.optString("message") ?: ""}") } } }
-        btn("Pull Requests") { bg({ api.get("/api/projects/$projectId/pull-requests") }) { r -> val d = r.optJSONArray("data") ?: JSONArray()
-          for (i in 0 until d.length()) { val pr = d.getJSONObject(i); line("#${pr.optInt("number")} [${pr.optString("state")}] ${pr.optString("title")}") } } } }
-      "Code" -> { if (!needProject()) return; header("Code Workspace ($branch)")
-        val path = input("File path (e.g. src/main.py)", filePath)
-        val editor = EditText(this).apply { hint = "File content"; minLines = 12 }
-        editor.addTextChangedListener(object : TextWatcher { override fun afterTextChanged(s: Editable?) { if (!dirty) { dirty = true; status.text = "Unsaved changes ●" } }
-          override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}; override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {} })
-        btn("Browse root files") { bg({ api.get("/api/projects/$projectId/files?branch=$branch") }) { r -> val d = r.optJSONArray("data") ?: JSONArray()
-          for (i in 0 until d.length()) line(d.getJSONObject(i).optString("path")) } }
-        btn("Open file") { filePath = path.text.toString(); bg({ api.get("/api/projects/$projectId/file?branch=$branch&path=$filePath") }) { r ->
-          fileSha = r.optString("sha").ifBlank { null }; editor.setText(r.optString("text")); dirty = false; status.text = "Opened $filePath" } }
-        body.addView(editor)
-        btn("Save & commit to GitHub") { val bodyJson = JSONObject().put("path", path.text.toString()).put("content", editor.text.toString())
-            .put("branch", branch).put("message", "Android edit ${path.text}")
-          if (fileSha != null) bodyJson.put("sha", fileSha)
-          bg({ api.put("/api/projects/$projectId/file", bodyJson) }) { dirty = false; line("Committed: $it (conflicts surface as errors, never silent overwrite)") } }
-        btn("Delete file (confirmation)") { AlertDialog.Builder(this).setTitle("Delete ${path.text}?").setPositiveButton("Delete") { _, _ ->
-          bg({ api.delete("/api/projects/$projectId/file", JSONObject().put("path", path.text.toString()).put("branch", branch).put("sha", fileSha ?: "")) }) { line("Deleted: $it") } }
-          .setNegativeButton("Cancel", null).show() } }
-      "Changes" -> { if (!needProject()) return; header("Git Changes ($branch vs main)")
-        btn("Load diff") { bg({ api.get("/api/projects/$projectId/diff?base=main&head=$branch") }) { r ->
-          val files = r.optJSONObject("diff")?.optJSONArray("files") ?: JSONArray()
-          for (i in 0 until files.length()) { val f = files.getJSONObject(i); line("${f.optString("filename")} +${f.optInt("additions")} -${f.optInt("deletions")}")
-            val lines = f.optJSONArray("lines") ?: JSONArray()
-            for (j in 0 until lines.length()) { val l = lines.getJSONObject(j)
-              body.addView(TextView(this).apply { text = l.optString("text"); setTextColor(when (l.optString("kind")) { "add" -> Color.rgb(0, 140, 0); "del" -> Color.rgb(190, 0, 0); "hunk" -> Color.rgb(0, 0, 180); else -> Color.DKGRAY }) }) } }
-          if (files.length() == 0) line("No differences.") } }
-        val title = input("Pull Request title")
-        btn("Create PR") { bg({ api.post("/api/projects/$projectId/pull-requests", JSONObject().put("branch", branch).put("title", title.text.toString()).put("task_id", "")) }) { line("PR result: $it") } } }
-      "Agents" -> { header("Agents (16 logical, on-demand)"); bg({ api.get("/api/agents") }) { r ->
-        val a = r.optJSONArray("agents") ?: JSONArray(); for (i in 0 until a.length()) line("• ${a.getJSONObject(i).optString("name")} — Idle/On-demand") } }
-      "Approvals" -> { header("Approval Center"); bg({ api.get("/api/approvals") }) { r ->
-        val a = r.optJSONArray("approvals") ?: JSONArray(); if (a.length() == 0) line("No pending approvals")
-        for (i in 0 until a.length()) { val ap = a.getJSONObject(i); line("${ap.optString("action")}: ${ap.optString("detail")} (project ${ap.optString("project_id")})")
-          btn("Approve ${ap.optString("id").take(12)}") { decide(ap.optString("id"), true) }
-          btn("Reject ${ap.optString("id").take(12)}") { decide(ap.optString("id"), false) } } } }
+  private fun show(target: String) {
+    screen = target; screenGeneration++
+    when (target) {
+      "Settings" -> settings()
+      "Dashboard" -> dashboard()
+      "Projects" -> projects()
+      "Repository" -> repository()
+      "Code" -> code()
+      "Changes" -> changes()
+      "Pull Requests" -> pullRequests()
+      "Agents" -> agents()
+      "Approvals" -> approvals()
     }
   }
-  private fun decide(id: String, ok: Boolean) {
-    bg({ api.post("/api/approvals/decide", JSONObject().put("id", id).put("approved", ok).put("by", "android")) }) { toast("Decision recorded: $it"); show("Approvals") }
+  private fun settings() {
+    header("Settings")
+    val base = input("Backend HTTPS URL", api.base)
+    val token = input("API token", api.token).apply { inputType = 129 }
+    button("Save and test") {
+      val candidate = ApiClient(base.text.toString(), token.text.toString())
+      bg({ candidate.health() }) { store.save("base", candidate.base); store.save("token", candidate.token); api = candidate; line("Connected: $it") }
+    }
+  }
+  private fun projects() {
+    header("Projects")
+    val name = input("New project name")
+    button("Create project") { bg({ api.createProject(name.text.toString(), autoStart = false) }) { r ->
+      projectId = r.optString("id"); store.save("project", projectId); branch = ""; defaultBranch = ""; browser = FileBrowserState(); directoryLoaded = false; show("Dashboard")
+    } }
+    bg({ api.listProjects() }) { r ->
+      val list = r.optJSONArray("projects") ?: JSONArray()
+      for (i in 0 until list.length()) {
+        val p = list.getJSONObject(i)
+        button("${p.optString("name")} — ${p.optString("lifecycle")}") {
+          projectId = p.optString("id"); store.save("project", projectId); branch = ""; defaultBranch = ""; browser = FileBrowserState(); directoryLoaded = false; show("Dashboard")
+        }
+      }
+    }
+  }
+  private fun dashboard() {
+    header("Dashboard")
+    if (!requireProject()) return
+    line("Project: $projectId")
+    val instruction = input("Describe the development task or blueprint").apply { minLines = 4 }
+    button("Submit blueprint / instructions") {
+      val text = instruction.text.toString()
+      bg({ api.submitInstruction(projectId, text) }) { line("Submitted: $it") }
+    }
+    button("Run GitHub execution") {
+      val text = instruction.text.toString()
+      AlertDialog.Builder(this).setTitle("Run agent execution?")
+        .setMessage("This may create commits and a pull request in the connected repository. Project tests require an isolated, explicitly enabled backend.")
+        .setNegativeButton("Cancel", null).setPositiveButton("Run") { _, _ ->
+          bg({ api.submitInstruction(projectId, text, mode = "github_execute") }) { line("GitHub job: $it") }
+        }.show()
+    }
+    button("Upload blueprint") { pickFile("blueprint") }
+    button("Upload ZIP, source, image or document") { pickFile("") }
+    val title = input("Task title")
+    val agent = input("Agent ID", "chief_orchestrator")
+    button("Create task") {
+      val t = title.text.toString(); val a = agent.text.toString(); val desc = instruction.text.toString()
+      bg({ api.createTask(projectId, a, t, desc) }) { line("Task: $it") }
+    }
+    button("Refresh task history & logs") { show("Dashboard") }
+    bg({ api.listTasks(projectId) }) { r ->
+      val tasks = r.optJSONArray("tasks") ?: JSONArray()
+      line("Task history: ${tasks.length()}")
+      for (i in 0 until tasks.length()) {
+        val t = tasks.getJSONObject(i)
+        button("${t.optString("status")} · ${t.optString("title")} · ${t.optString("agent_name")}") {
+          bg({ api.getTaskDetail(projectId, t.optString("id")) }) { detail -> line("Task detail and logs: ${detail.toString(2)}") }
+        }
+      }
+    }
+    bg({ api.listProjectLogs(projectId) }) { r -> line("Recent logs: ${r.optJSONArray("logs") ?: JSONArray()}") }
+  }
+  private fun pickFile(category: String) {
+    uploadCategory = category
+    startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply { addCategory(Intent.CATEGORY_OPENABLE); type = "*/*" }, 42)
+  }
+  @Deprecated("Activity result API")
+  override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+    super.onActivityResult(requestCode, resultCode, data)
+    val uri = data?.data ?: return
+    if (requestCode != 42 || resultCode != RESULT_OK || !requireProject()) return
+    val pid = projectId; val cat = uploadCategory
+    Thread {
+      try {
+        var filename = ""
+        contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
+          if (c.moveToFirst()) filename = c.getString(0) ?: ""
+        }
+        val bytes = contentResolver.openInputStream(uri)?.use { stream ->
+          val out = java.io.ByteArrayOutputStream(); val buf = ByteArray(8192)
+          while (true) { val n = stream.read(buf); if (n < 0) break; if (out.size() + n > 20 * 1024 * 1024) throw IllegalArgumentException("File exceeds 20 MB"); out.write(buf, 0, n) }
+          out.toByteArray()
+        } ?: throw IllegalArgumentException("Cannot read selected file")
+        val validation = UploadClassifier.validate(filename, bytes.size.toLong())
+        if (!validation.first) throw IllegalArgumentException(validation.second)
+        val result = api.uploadArtifact(pid, filename, Base64.encodeToString(bytes, Base64.NO_WRAP), UploadClassifier.classify(filename, cat))
+        runOnUiThread { toast("Upload complete: ${result.optString("filename")}") }
+      } catch (e: Exception) { runOnUiThread { toast("Upload failed: ${e.message}") } }
+    }.start()
+  }
+  private fun repository() {
+    header("Repository")
+    if (!requireProject()) return
+    val repo = input("owner/repository")
+    button("Connect repository") { val value = repo.text.toString(); bg({ api.connectRepository(projectId, value) }) { show("Repository") } }
+    button("Refresh repository metadata") { bg({ api.refreshRepository(projectId) }) { show("Repository") } }
+    val newBranch = input("New working branch")
+    button("Create branch from default") { val value = newBranch.text.toString(); bg({ api.createBranch(projectId, value) }) { show("Repository") } }
+    bg({ api.listBranches(projectId) }) { r ->
+      branch = r.optString("working_branch"); defaultBranch = r.optString("default_branch")
+      line("Default: $defaultBranch · Working: $branch")
+      val list = r.optJSONArray("data") ?: JSONArray()
+      for (i in 0 until list.length()) {
+        val name = list.getJSONObject(i).optString("name")
+        button("Select $name") { bg({ api.selectWorkingBranch(projectId, name) }) { branch = name; browser = FileBrowserState(); directoryLoaded = false; show("Repository") } }
+      }
+    }
+    button("Status and commits") { bg({ api.branchStatus(projectId) }) { line("Status: $it") }; bg({ api.listCommits(projectId) }) { line("Commits: $it") } }
+  }
+  private fun code() {
+    header("Code · ${branch.ifBlank { "working branch" }}")
+    if (!requireProject()) return
+    line("Directory: /${browser.currentDir}")
+    if (browser.canGoUp) button("Up") { guard { listDir(browser.parentDir()) } }
+    button("Refresh directory") { guard { listDir(browser.currentDir) } }
+    val newPath = input("New file path")
+    button("Create file in editor") { guard {
+      val path = browser.resolveChildPath(newPath.text.toString())
+      try { browser.beginNewFile(path); code() } catch (e: Exception) { toast(e.message ?: "Invalid path") }
+    } }
+    if (!directoryLoaded && !browser.hasOpenFile) listDir(browser.currentDir)
+    for (entry in browser.entries) {
+      button("${if (entry.isDir) "📁" else "📄"} ${entry.name}") {
+        guard { if (entry.isDir) listDir(entry.path) else openFile(entry.path) }
+      }
+    }
+    if (!browser.hasOpenFile) return
+    val label = TextView(this).apply { text = "Editing ${browser.openPath}${if (browser.isDirty) " ● unsaved" else ""}" }; body.addView(label)
+    val editor = input("File contents", browser.currentContent).apply { minLines = 10 }
+    editor.addTextChangedListener(object : TextWatcher {
+      override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+      override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { browser.updateEditorText(s.toString()); label.text = "Editing ${browser.openPath}${if (browser.isDirty) " ● unsaved" else ""}" }
+      override fun afterTextChanged(s: Editable?) {}
+    })
+    button("Save and commit") {
+      val path = browser.openPath; val content = browser.currentContent; val sha = browser.openSha; val isNew = browser.isNewUnsavedFile; val activeBranch = branch
+      if (!isNew && sha.isNullOrBlank()) { toast("Missing remote SHA; reload before saving"); return@button }
+      bg({ if (isNew) api.createFile(projectId, path, content, activeBranch, "Create $path") else api.saveFile(projectId, path, content, sha!!, activeBranch, "Update $path") }) { r ->
+        val newSha = r.optString("sha")
+        if (newSha.isBlank()) { toast("Saved but no SHA returned; reload before further edits"); browser.closeFile(); listDir(browser.currentDir) }
+        else { val latest = browser.currentContent; browser.markSaved(path, newSha, content); browser.updateEditorText(latest); code() }
+      }
+    }
+    val rename = input("Rename to path")
+    button("Rename") { guard {
+      val old = browser.openPath; val sha = browser.openSha; val next = rename.text.toString()
+      if (old.isBlank() || sha.isNullOrBlank()) { toast("Open a saved file first"); return@guard }
+      bg({ api.renameFile(projectId, old, next, sha, branch, "Rename $old") }) { browser.closeFile(); listDir(browser.currentDir) }
+    } }
+    button("Delete") {
+      val path = browser.openPath; val sha = browser.openSha
+      if (sha.isNullOrBlank()) { toast("Open a saved file first"); return@button }
+      AlertDialog.Builder(this).setTitle("Delete $path?").setMessage("This commits a deletion to the selected branch.")
+        .setNegativeButton("Cancel", null).setPositiveButton("Delete") { _, _ ->
+          bg({ api.deleteFile(projectId, path, sha, branch, "Delete $path") }) { browser.closeFile(); listDir(browser.currentDir) }
+        }.show()
+    }
+  }
+  private fun listDir(path: String) {
+    bg({ api.listFiles(projectId, path, branch.ifBlank { null }) }) { r ->
+      val array = r.optJSONArray("data") ?: JSONArray(); val entries = mutableListOf<RepoEntry>()
+      for (i in 0 until array.length()) { val e = array.getJSONObject(i); entries.add(RepoEntry(e.optString("name"), e.optString("path"), e.optString("type"), e.optInt("size"), e.optString("sha"))) }
+      browser.setDirectoryListing(path, entries); directoryLoaded = true; code()
+    }
+  }
+  private fun openFile(path: String) { bg({ api.readFile(projectId, path, branch.ifBlank { null }) }) { r -> browser.openLoadedFile(path, r.optString("text"), r.optString("sha")); code() } }
+  private fun changes() {
+    header("Branch comparison")
+    if (!requireProject()) return
+    val base = input("Base branch (blank uses repository default)", defaultBranch)
+    val head = input("Head branch (blank uses working branch)", branch)
+    button("Compare") { val b = base.text.toString(); val h = head.text.toString(); bg({ api.compareBranches(projectId, b, h) }) { line(it.toString(2)) } }
+    val title = input("Pull Request title")
+    button("Create Pull Request") { val t = title.text.toString(); val b = base.text.toString(); val h = head.text.toString(); bg({ api.createPullRequest(projectId, t, h, b) }) { line("PR: $it") } }
+  }
+  private fun pullRequests() {
+    header("Pull Requests")
+    if (!requireProject()) return
+    button("Refresh") { show("Pull Requests") }
+    bg({ api.listPullRequests(projectId) }) { r ->
+      val list = r.optJSONArray("data") ?: JSONArray()
+      for (i in 0 until list.length()) { val pr = list.getJSONObject(i); val number = pr.optInt("number"); button("#$number ${pr.optString("state")} · ${pr.optString("title")}") { prDetail(number) } }
+    }
+  }
+  private fun prDetail(number: Int) {
+    screenGeneration++; header("Pull Request #$number")
+    button("Back to Pull Requests") { show("Pull Requests") }
+    bg({ api.getPullRequest(projectId, number) }) { r ->
+      val pr = r.optJSONObject("pr") ?: JSONObject(); line(pr.toString(2)); line("Reviews: ${r.optJSONArray("reviews")}"); line("Comments: ${r.optJSONArray("comments")}")
+      val comment = input("Review or comment")
+      button("Comment") { val text = comment.text.toString(); bg({ api.commentPullRequest(projectId, number, text) }) { prDetail(number) } }
+      button("Approve review") { val text = comment.text.toString(); bg({ api.reviewPullRequest(projectId, number, "APPROVE", text) }) { prDetail(number) } }
+      button("Request changes") { val text = comment.text.toString(); bg({ api.reviewPullRequest(projectId, number, "REQUEST_CHANGES", text) }) { prDetail(number) } }
+      button("Request merge authorization") { bg({ api.requestMergeApproval(projectId, number) }) { line("Approve in Approvals: $it") } }
+      val aid = r.optString("ready_approval_id", "").takeUnless { it == "null" } ?: ""
+      if (aid.isNotBlank()) button("Merge with approved authorization") {
+        AlertDialog.Builder(this).setTitle("Merge PR #$number?").setMessage("This will merge into ${pr.optString("base_branch")} and consume the approval.")
+          .setNegativeButton("Cancel", null).setPositiveButton("Merge") { _, _ ->
+            val sha = pr.optString("head_sha"); bg({ api.mergePullRequest(projectId, number, aid, expectedHeadSha = sha) }) { line("Merge result: $it") }
+          }.show()
+      }
+    }
+    bg({ api.listPrFiles(projectId, number) }) { line("Changed files and diffs: ${it.toString(2)}") }
+  }
+  private fun agents() {
+    header("Agent activity")
+    button("Refresh") { show("Agents") }
+    bg({ api.listAgents() }) { r -> val a = r.optJSONArray("agents") ?: JSONArray(); for (i in 0 until a.length()) line(a.getJSONObject(i).toString()) }
+  }
+  private fun approvals() {
+    header("Approval Center")
+    bg({ api.listApprovals(projectId.ifBlank { null }) }) { r ->
+      val approvals = r.optJSONArray("approvals") ?: JSONArray()
+      for (i in 0 until approvals.length()) {
+        val a = approvals.getJSONObject(i); val id = a.optString("id"); line("${a.optString("action")}: ${a.optString("detail")}")
+        button("Approve $id") { bg({ api.decideApproval(id, true) }) { show("Approvals") } }
+        button("Reject $id") { bg({ api.decideApproval(id, false) }) { show("Approvals") } }
+      }
+    }
   }
 }

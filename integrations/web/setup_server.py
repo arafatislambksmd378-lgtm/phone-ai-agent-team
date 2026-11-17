@@ -340,14 +340,47 @@ class SetupPortalController:
                 self._engine = None
 
 
-def create_setup_http_server(host: str = "0.0.0.0", port: int = 8080,
-                             controller: SetupPortalController | None = None) -> ThreadingHTTPServer:
-    """Create a ThreadingHTTPServer bound to 0.0.0.0 compatible with reverse-proxy previews & Termux."""
+def create_setup_http_server(host: str = "127.0.0.1", port: int = 8080,
+                             controller: SetupPortalController | None = None,
+                             auth_token: str | None = None) -> ThreadingHTTPServer:
+    """Create a ThreadingHTTPServer for credential setup.
+
+    Security: binding to any non-loopback address (e.g. 0.0.0.0) fails closed unless a
+    strong `auth_token` (or WEB_SETUP_TOKEN) is configured and supplied as Bearer token.
+    """
+    import hmac
+    from security.validation import is_loopback_host, validate_api_token
+
+    token = auth_token if auth_token is not None else os.getenv("WEB_SETUP_TOKEN", "")
+    loopback = is_loopback_host(host)
+    if not loopback:
+        ok_tok, reason = validate_api_token(token)
+        if not ok_tok:
+            raise ValueError(
+                f"Refusing to bind Web Setup Portal to external host {host!r} without a strong "
+                f"WEB_SETUP_TOKEN: {reason}"
+            )
+    elif token:
+        ok_tok, reason = validate_api_token(token)
+        if not ok_tok:
+            raise ValueError(f"Invalid WEB_SETUP_TOKEN: {reason}")
+
     ctrl = controller or SetupPortalController()
 
     class SetupHandler(BaseHTTPRequestHandler):
         def log_message(self, fmt: str, *args) -> None:
             log.info("web %s - %s", self.address_string(), redact(fmt % args))
+
+        def _check_auth(self) -> bool:
+            if not token:
+                return True  # strictly reachable only when `is_loopback_host(host)` is True
+            header = self.headers.get("Authorization") or ""
+            if not header.startswith("Bearer "):
+                return False
+            provided = header[7:]
+            return bool(provided) and hmac.compare_digest(
+                provided.encode("utf-8"), token.encode("utf-8"),
+            )
 
         def _send_json(self, code: int, payload: dict) -> None:
             raw = json.dumps(payload).encode("utf-8")
@@ -382,6 +415,8 @@ def create_setup_http_server(host: str = "0.0.0.0", port: int = 8080,
                 return None
 
         def do_GET(self) -> None:
+            if not self._check_auth():
+                return self._send_json(401, {"ok": False, "error": "unauthorized"})
             path = urlparse(self.path).path.rstrip("/") or "/"
             if path in ("/", "/setup"):
                 return self._send_html(200, SETUP_HTML)
@@ -390,6 +425,8 @@ def create_setup_http_server(host: str = "0.0.0.0", port: int = 8080,
             self._send_json(404, {"ok": False, "error": "Not found"})
 
         def do_POST(self) -> None:
+            if not self._check_auth():
+                return self._send_json(401, {"ok": False, "error": "unauthorized"})
             path = urlparse(self.path).path.rstrip("/")
             body = self._read_json()
             if body is None:

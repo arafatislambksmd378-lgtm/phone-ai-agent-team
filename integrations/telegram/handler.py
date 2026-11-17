@@ -14,6 +14,8 @@ HELP = """*Phone AI Agent Team* — commands
 /new <name> [blueprint] — create a project (starts immediately if blueprint included, else waits for text/file)
 /build [id] — start or replan dynamic pipeline for active project
 /status [id] — project lifecycle, category & task statuses
+/tasks [id] — list all tasks (from Telegram & Android dashboard)
+/sync [id] — recent dashboard ↔ Telegram synchronization events
 /agents — list all 16 specialist agents & current state
 /pause /resume — pause or resume the worker pool
 /stop <id> — cancel a project
@@ -59,8 +61,12 @@ class TelegramHandler:
         chat_id = self._chat_for_project(project_id)
         if not chat_id:
             return
-        # Deliver key milestones and errors without flooding every sub-second tick
-        if any(message.startswith(p) for p in ("Planned ", "✗ ", "↻ ", "⚠️", "⏸", "♻️", "🔄")):
+        # Deliver key milestones, dashboard-originated activity, and errors without flooding
+        if any(message.startswith(p) for p in (
+            "Planned ", "✗ ", "↻ ", "⚠️", "⏸", "♻️", "🔄",
+            "📁 Project created (dashboard)", "📝 Task created (dashboard)",
+            "📦 Uploaded ZIP (dashboard)", "📎 Uploaded ", "🔐 ",
+        )):
             self._bot.send_message(chat_id, f"[{project_id}] {message}")
 
     def _on_engine_approval(self, approval_row: dict) -> None:
@@ -173,7 +179,7 @@ class TelegramHandler:
                 bot.send_message(chat_id, f"⚠️ Approval `{aid}` could not be changed (status: {status_now}).")
             return
 
-        self.engine.on_approval_decided(aid, approved=approved)
+        self.engine.on_approval_decided(aid, approved=approved, source="telegram")
         if cb_id:
             bot.answer_callback_query(cb_id, f"{'Approved' if approved else 'Rejected'} {aid}")
         if chat_id and message_id:
@@ -187,7 +193,8 @@ class TelegramHandler:
         return {
             "/start": self._cmd_start, "/help": self._cmd_help,
             "/new": self._cmd_new, "/build": self._cmd_build,
-            "/status": self._cmd_status, "/agents": self._cmd_agents,
+            "/status": self._cmd_status, "/tasks": self._cmd_tasks,
+            "/sync": self._cmd_sync, "/agents": self._cmd_agents,
             "/pause": self._cmd_pause, "/resume": self._cmd_resume,
             "/stop": self._cmd_stop, "/cancel": self._cmd_stop,
             "/approve": self._cmd_approve, "/reject": self._cmd_reject,
@@ -225,6 +232,7 @@ class TelegramHandler:
             requirements=blueprint if has_inline_blueprint else f"Project: {name}",
             quick=False,
             auto_start=has_inline_blueprint,
+            source="telegram",
         )
         self.current[chat_id] = pid
         self._project_chats[pid] = chat_id
@@ -249,7 +257,7 @@ class TelegramHandler:
         pid = self._project_id(chat_id, arg)
         if not pid:
             return bot.send_message(chat_id, "Usage: /build <project_id>")
-        res = self.engine.replan_project(pid)
+        res = self.engine.replan_project(pid, source="telegram")
         if not res.get("ok"):
             return bot.send_message(chat_id, f"⚠️ {res.get('error')}")
         st = self.engine.status(pid)
@@ -285,6 +293,40 @@ class TelegramHandler:
             lines.append(f"\n⚠️ {len(st['pending_approvals'])} approval(s) pending — /pending")
         bot.send_message(chat_id, "\n".join(lines))
 
+    def _cmd_tasks(self, bot, chat_id, arg):
+        import json as _json
+        pid = self._project_id(chat_id, arg)
+        if not pid:
+            # Default to most recent project so dashboard-created projects are immediately visible
+            projs = self.engine.db.list_projects()
+            if not projs:
+                return bot.send_message(chat_id, "No projects yet — use /new or create one in Android dashboard.")
+            pid = projs[0]["id"]
+        proj = self.engine.db.get_project(pid)
+        if not proj:
+            return bot.send_message(chat_id, f"Unknown project: {pid}")
+        tasks = self.engine.db.list_tasks(pid)
+        if not tasks:
+            return bot.send_message(chat_id, f"*{proj['name']}* (`{pid}`): no tasks yet.")
+        lines = [f"*Tasks — {proj['name']}* (`{pid}`)"]
+        for t in tasks[:30]:
+            try:
+                src = _json.loads(t.get("payload") or "{}").get("source") or "orchestrator"
+            except Exception:
+                src = "orchestrator"
+            lines.append(f"• `{t['id']}` [{t['status']}] `{t['agent_id']}` — {t['title']} _({src})_")
+        bot.send_message(chat_id, "\n".join(lines))
+
+    def _cmd_sync(self, bot, chat_id, arg):
+        pid = (arg or "").split()[0] if arg else ""
+        events = self.engine.db.list_sync_events(pid or None, limit=15)
+        if not events:
+            return bot.send_message(chat_id, "No synchronization events recorded yet.")
+        lines = ["*Synchronization Feed*"]
+        for ev in events:
+            lines.append(f"• [{ev['source']}] `{ev['event']}` {ev['project_id']}: {ev['detail'][:100]}")
+        bot.send_message(chat_id, "\n".join(lines))
+
     def _cmd_agents(self, bot, chat_id, arg):
         rows = self.engine.agent_statuses()
         body = "\n".join(
@@ -314,7 +356,7 @@ class TelegramHandler:
         aid = arg.split()[0]
         ok = self.engine.approvals.approve(aid, by=str(chat_id))
         if ok:
-            self.engine.on_approval_decided(aid, approved=True)
+            self.engine.on_approval_decided(aid, approved=True, source="telegram")
             bot.send_message(chat_id, f"✅ Approved {aid}.")
         else:
             bot.send_message(chat_id, f"No pending approval {aid}.")
@@ -325,7 +367,7 @@ class TelegramHandler:
         aid = arg.split()[0]
         ok = self.engine.approvals.reject(aid, by=str(chat_id))
         if ok:
-            self.engine.on_approval_decided(aid, approved=False)
+            self.engine.on_approval_decided(aid, approved=False, source="telegram")
             bot.send_message(chat_id, f"❌ Rejected {aid}.")
         else:
             bot.send_message(chat_id, f"No pending approval {aid}.")
@@ -435,7 +477,7 @@ class TelegramHandler:
         self._project_chats[pid] = chat_id
         was_waiting = (self.engine.lifecycle.get(pid) == "INPUT_RECEIVED"
                        and not self.engine.db.list_tasks(pid))
-        res = self.engine.replan_project(pid, additional_requirements=text)
+        res = self.engine.replan_project(pid, additional_requirements=text, source="telegram")
         if was_waiting and res.get("ok"):
             st = self.engine.status(pid)
             stype = (st.get("blueprint_analysis") or {}).get("software_type", "web_app")
@@ -459,7 +501,7 @@ class TelegramHandler:
         if not ok:
             return bot.send_message(chat_id, f"⛔ Download refused: {msg}")
         try:
-            ok, msg = self.engine.ingest_upload(pid, tmp, name, auto_plan_if_waiting=True)
+            ok, msg = self.engine.ingest_upload(pid, tmp, name, auto_plan_if_waiting=True, source="telegram")
         finally:
             try:
                 Path(tmp).unlink()

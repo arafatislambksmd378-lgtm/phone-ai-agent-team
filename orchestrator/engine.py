@@ -23,7 +23,12 @@ from orchestrator.planner import TaskPlanner
 from orchestrator.scheduler import Scheduler
 from security.approval import ApprovalManager, ApprovalRequiredError
 from security.secret_manager import redact
-from security.validation import safe_extract_zip, validate_upload, validate_upload_content
+from security.validation import (
+    classify_upload_category,
+    safe_extract_zip,
+    validate_upload,
+    validate_upload_content,
+)
 
 log = logging.getLogger("orchestrator")
 
@@ -69,6 +74,16 @@ class OrchestratorEngine:
         self._on_approval = None
         self._on_completion = None
         self._finish_lock = threading.Lock()
+        self._plan_guard = threading.Lock()
+        self._project_locks: dict[str, threading.Lock] = {}
+
+    def _lock_for_project(self, project_id: str) -> threading.Lock:
+        with self._plan_guard:
+            lk = self._project_locks.get(project_id)
+            if lk is None:
+                lk = threading.Lock()
+                self._project_locks[project_id] = lk
+            return lk
 
     # ---------- hooks ----------
     def set_progress_callback(self, fn) -> None:
@@ -124,13 +139,21 @@ class OrchestratorEngine:
 
     # ---------- project intake & dynamic planning ----------
     def create_project(self, name: str, requirements: str = "", quick: bool = False,
-                       *, auto_start: bool = True, dynamic: bool = True) -> str:
+                       *, auto_start: bool = True, dynamic: bool = True,
+                       source: str = "system", description: str = "") -> str:
         safe_name = "".join(c for c in (name or "project") if c.isalnum() or c in "-_")[:40] or "project"
         ws = str((self.settings.workspace_root / f"{safe_name}_{int(time.time() * 1000)}").resolve())
         Path(ws).mkdir(parents=True, exist_ok=True)
-        pid = self.db.create_project(safe_name, ws, {"requirements_preview": (requirements or "")[:500]})
+        pid = self.db.create_project(safe_name, ws, {
+            "requirements_preview": (requirements or "")[:500],
+            "description": (description or "")[:1000],
+            "created_via": source,
+        })
+        if description:
+            self.db.execute("UPDATE projects SET description=? WHERE id=?", ((description or "")[:1000], pid))
+        self.db.record_sync(pid, source, "project_created", safe_name)
         self.lifecycle.set(pid, "INPUT_RECEIVED")
-        self._notify(pid, f"Project created: {safe_name}")
+        self._notify(pid, f"📁 Project created ({source}): {safe_name}")
         FileManager(ws).write("requirements.txt", requirements or f"Project: {name}")
         sb = Sandbox(ws)
         sb.init_git()
@@ -139,37 +162,45 @@ class OrchestratorEngine:
             self.db.record_checkpoint(pid, "initial blueprint", sha)
 
         if auto_start:
-            self.start_project(pid, requirements=requirements, quick=quick, dynamic=dynamic)
+            self.start_project(pid, requirements=requirements, quick=quick, dynamic=dynamic, source=source)
         return pid
 
     def start_project(self, project_id: str, requirements: str | None = None,
-                      quick: bool = False, *, dynamic: bool = True) -> list[str]:
+                      quick: bool = False, *, dynamic: bool = True,
+                      source: str = "system") -> list[str]:
         """Validate blueprint, dynamically plan the Task DAG, and launch on-demand worker(s)."""
         proj = self.db.get_project(project_id)
         if not proj:
             raise ValueError(f"Unknown project: {project_id}")
-        fm = FileManager(proj["workspace"])
-        req_text = requirements if requirements is not None else (
-            fm.read("requirements.txt") if fm.exists("requirements.txt") else ""
-        )
-        self.lifecycle.set(project_id, "VALIDATING")
-        self.lifecycle.set(project_id, "PLANNING")
-        task_ids = self.planner.plan(project_id, req_text, quick=quick, dynamic=dynamic)
-        analysis = self.db.get_memory(project_id).get("blueprint_analysis") or {}
-        stype = analysis.get("software_type", "web_app")
-        excluded = list((analysis.get("excluded_agents") or {}).keys())
-        self.lifecycle.set(project_id, "QUEUED")
-        excl_note = f" (excluded {len(excluded)} irrelevant agents)" if excluded else ""
-        self._notify(
-            project_id,
-            f"Planned {len(task_ids)} tasks for `{stype}`{excl_note}. Starting worker pool…",
-        )
+        with self._lock_for_project(project_id):
+            fm = FileManager(proj["workspace"])
+            if requirements is not None and requirements.strip():
+                fm.write("requirements.txt", requirements[:400_000])
+            req_text = requirements if requirements is not None else (
+                fm.read("requirements.txt") if fm.exists("requirements.txt") else ""
+            )
+            self.lifecycle.set(project_id, "VALIDATING")
+            self.lifecycle.set(project_id, "PLANNING")
+            task_ids = self.planner.plan(project_id, req_text, quick=quick, dynamic=dynamic)
+            analysis = self.db.get_memory(project_id).get("blueprint_analysis") or {}
+            stype = analysis.get("software_type", "web_app")
+            excluded = list((analysis.get("excluded_agents") or {}).keys())
+            self.lifecycle.set(project_id, "QUEUED")
+            self.db.record_sync(
+                project_id, source, "project_planned",
+                f"{stype}: {len(task_ids)} tasks planned",
+            )
+            excl_note = f" (excluded {len(excluded)} irrelevant agents)" if excluded else ""
+            self._notify(
+                project_id,
+                f"Planned {len(task_ids)} tasks for `{stype}` via {source}{excl_note}. Starting worker pool…",
+            )
         self.scheduler.start()
         return task_ids
 
     def replan_project(self, project_id: str, additional_requirements: str = "",
-                       execution_feedback: str = "") -> dict:
-        """Update requirements and dynamically replan the project's Task DAG."""
+                       execution_feedback: str = "", *, source: str = "system") -> dict:
+        """Update requirements and dynamically replan the project's Task DAG (concurrency-safe)."""
         proj = self.db.get_project(project_id)
         if not proj:
             return {"ok": False, "error": "Project not found"}
@@ -179,73 +210,226 @@ class OrchestratorEngine:
         full_req = fm.read("requirements.txt") if fm.exists("requirements.txt") else additional_requirements
 
         if not self.db.list_tasks(project_id):
-            tids = self.start_project(project_id, requirements=full_req)
-            return {"ok": True, "started": True, "task_count": len(tids)}
+            tids = self.start_project(project_id, requirements=full_req, source=source)
+            analysis = self.db.get_memory(project_id).get("blueprint_analysis") or {}
+            return {
+                "ok": True,
+                "started": True,
+                "task_count": len(tids),
+                "task_ids": tids,
+                "software_type": analysis.get("software_type", "web_app"),
+                "selected_agents": analysis.get("selected_agents", []),
+                "excluded_agents": analysis.get("excluded_agents", {}),
+            }
 
-        info = self.planner.replan(project_id, full_req, execution_feedback=execution_feedback)
-        state = self.lifecycle.get(project_id)
-        if state in ("FAILED", "PAUSED"):
-            self.lifecycle.set(project_id, "RECOVERING")
-            self.lifecycle.set(project_id, "QUEUED")
+        with self._lock_for_project(project_id):
+            info = self.planner.replan(project_id, full_req, execution_feedback=execution_feedback)
+            state = self.lifecycle.get(project_id)
+            if state in ("FAILED", "PAUSED"):
+                self.lifecycle.set(project_id, "RECOVERING")
+                self.lifecycle.set(project_id, "QUEUED")
+            elif state == "COMPLETED" and (info["added_agents"] or info["requeued_agents"]):
+                self.lifecycle.set(project_id, "QUEUED")
+            self.db.record_sync(
+                project_id, source, "project_replanned",
+                f"{info['software_type']}: +{len(info['added_agents'])} added, {len(info['requeued_agents'])} requeued",
+            )
         if info["added_agents"] or info["requeued_agents"]:
             self.scheduler.start()
             self._notify(
                 project_id,
-                f"🔄 Replanned `{info['software_type']}`: "
+                f"🔄 Replanned `{info['software_type']}` ({source}): "
                 f"+{len(info['added_agents'])} added, {len(info['requeued_agents'])} requeued.",
             )
         return {"ok": True, **info}
 
-    def ingest_upload(self, project_id: str, local_path: str, original_name: str,
-                      *, auto_plan_if_waiting: bool = False) -> tuple[bool, str]:
-        """Validate, safely extract text/ZIP, and stage an uploaded blueprint into the workspace."""
+    def create_single_task(self, project_id: str, agent_id: str, title: str,
+                           instruction: str = "", *, priority: int = 100,
+                           depends_on: list[str] | None = None,
+                           auto_run: bool = True, source: str = "dashboard") -> dict:
+        """Create (idempotently per project+agent+title) a task and optionally run it."""
         proj = self.db.get_project(project_id)
         if not proj:
-            return False, "Project not found"
+            return {"ok": False, "status": 404, "error": "Project not found"}
+        if agent_id not in AGENT_NAMES:
+            return {"ok": False, "status": 400, "error": f"Unknown agent_id: {agent_id!r}"}
+        clean_title = (title or "").strip()
+        if not clean_title:
+            return {"ok": False, "status": 400, "error": "Task title is required"}
+        with self._lock_for_project(project_id):
+            existing = self.db.query_one(
+                "SELECT id, status FROM tasks WHERE project_id=? AND agent_id=? AND title=?",
+                (project_id, agent_id, clean_title[:200]),
+            )
+            if existing:
+                return {
+                    "ok": True,
+                    "status": 200,
+                    "id": existing["id"],
+                    "task_status": existing["status"],
+                    "deduplicated": True,
+                }
+            if instruction and instruction.strip():
+                self._append_requirements(project_id, f"\n--- Task ({agent_id}): {clean_title} ---\n{instruction.strip()}")
+            fm = FileManager(proj["workspace"])
+            req_text = fm.read("requirements.txt") if fm.exists("requirements.txt") else instruction
+            payload = {
+                "instruction": (instruction or "")[:8000],
+                "requirements": (req_text or instruction or "")[:8000],
+                "source": source,
+            }
+            if agent_id == "workspace_executor":
+                payload.setdefault("command", "ls -la")
+            tid = self.db.create_task(
+                project_id, agent_id, clean_title[:200], payload=payload,
+                priority=max(1, min(1000, int(priority or 100))),
+                depends_on=depends_on,
+            )
+            self.db.record_sync(project_id, source, "task_created", f"{tid} ({agent_id}: {clean_title[:80]})")
+            cur_lc = self.lifecycle.get(project_id)
+            if auto_run and cur_lc in ("IDLE", "INPUT_RECEIVED", "COMPLETED", "FAILED"):
+                self.lifecycle.set(project_id, "QUEUED")
+        self._notify(project_id, f"📝 Task created ({source}): `{agent_id}` — {clean_title[:100]}")
+        if auto_run:
+            self.scheduler.start()
+        return {"ok": True, "status": 201, "id": tid, "task_status": "QUEUED", "deduplicated": False}
+
+    def ingest_upload_detailed(self, project_id: str, local_path: str, original_name: str,
+                               *, auto_plan_if_waiting: bool = False,
+                               source: str = "dashboard", category: str | None = None,
+                               caption: str = "") -> dict:
+        """Validate, extract/stage an uploaded blueprint, ZIP, source file, document, or image."""
+        import hashlib
+
+        proj = self.db.get_project(project_id)
+        if not proj:
+            return {"ok": False, "status": 404, "error": "Project not found"}
+        safe_filename = Path(original_name or "").name
         size = Path(local_path).stat().st_size
-        ok, msg = validate_upload(original_name, size, self.settings.max_upload_mb)
+        ok, msg = validate_upload(safe_filename, size, self.settings.max_upload_mb)
         if not ok:
-            return False, msg
-        ok, msg = validate_upload_content(original_name, local_path)
+            return {"ok": False, "status": 400, "error": msg}
+        ok, msg = validate_upload_content(safe_filename, local_path)
         if not ok:
-            return False, msg
+            return {"ok": False, "status": 400, "error": msg}
+
+        raw_bytes = Path(local_path).read_bytes()
+        digest = hashlib.sha256(raw_bytes).hexdigest()
+        detected_cat = classify_upload_category(safe_filename)
+        allowed_cats = {"blueprint", "zip", "source", "image", "document"}
+        resolved_cat = detected_cat
+        if category and category.strip().lower() in allowed_cats:
+            req_cat = category.strip().lower()
+            if req_cat == "blueprint" and detected_cat in ("document", "source"):
+                resolved_cat = "blueprint"
 
         ws = Path(proj["workspace"])
-        if original_name.lower().endswith(".zip"):
-            ok, msg, files = safe_extract_zip(
+        ws.mkdir(parents=True, exist_ok=True)
+        auto_planned = False
+        clean_caption = redact((caption or "").strip())[:1000]
+
+        if detected_cat == "zip":
+            ok_z, msg_z, files = safe_extract_zip(
                 local_path,
                 str(ws / "extracted"),
                 max_files=self.settings.max_zip_files,
                 max_total_mb=self.settings.max_zip_mb,
                 max_archive_mb=self.settings.max_upload_mb,
             )
-            if ok:
-                extracted_text = extract_directory_corpus(ws / "extracted", max_files=20, max_chars=60_000)
-                header = f"\n--- Blueprint archive: {original_name} ({len(files)} files) ---\n"
-                self._append_requirements(project_id, header + extracted_text)
-                if auto_plan_if_waiting and self.lifecycle.get(project_id) == "INPUT_RECEIVED" and not self.db.list_tasks(project_id):
-                    self.start_project(project_id)
-            return ok, msg
+            if not ok_z:
+                return {"ok": False, "status": 400, "error": msg_z}
+            extracted_text = extract_directory_corpus(ws / "extracted", max_files=25, max_chars=60_000)
+            note = f"Note: {clean_caption}\n" if clean_caption else ""
+            header = f"\n--- Blueprint archive ({source}): {safe_filename} ({len(files)} files) ---\n{note}"
+            self._append_requirements(project_id, header + extracted_text)
+            summary = f"Extracted {len(files)} files"
+            uid = self.db.record_uploaded_artifact(
+                project_id, safe_filename, sha256=digest, source=source,
+                category="zip", size_bytes=size, stored_path="extracted/", summary=summary,
+            )
+            self.db.record_sync(project_id, source, "artifact_uploaded", f"zip:{safe_filename} ({len(files)} files)")
+            if auto_plan_if_waiting and self.lifecycle.get(project_id) in ("IDLE", "INPUT_RECEIVED") and not self.db.list_tasks(project_id):
+                self.start_project(project_id, source=source)
+                auto_planned = True
+            self._notify(project_id, f"📦 Uploaded ZIP ({source}): {safe_filename} — {summary}")
+            return {
+                "ok": True,
+                "status": 201,
+                "upload_id": uid,
+                "filename": safe_filename,
+                "category": "zip",
+                "size_bytes": size,
+                "sha256": digest,
+                "extracted_files": files[:100],
+                "extracted_count": len(files),
+                "auto_planned": auto_planned,
+                "message": msg_z,
+            }
 
-        dest = ws / "uploads" / Path(original_name).name
+        subdir = {
+            "image": "images",
+            "source": "source",
+            "blueprint": "blueprints",
+            "document": "docs",
+        }.get(resolved_cat, "docs")
+        dest = ws / "uploads" / subdir / safe_filename
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_bytes(Path(local_path).read_bytes())
+        dest.write_bytes(raw_bytes)
         try:
             dest.chmod(0o600)
         except OSError:
             pass
 
-        doc = extract_document_text(dest, original_name, max_chars=80_000)
+        doc = extract_document_text(dest, safe_filename, max_chars=80_000)
         if not doc.get("ok"):
-            return False, doc.get("warning") or "Could not extract document text"
+            return {"ok": False, "status": 400, "error": doc.get("warning") or "Could not process uploaded file"}
         extracted_text = doc.get("text") or ""
+        caption_line = f"\nUser note: {clean_caption}" if clean_caption else ""
         self._append_requirements(
             project_id,
-            f"\n--- Uploaded {original_name} ({doc['kind']}) ---\n{extracted_text}",
+            f"\n--- Uploaded {resolved_cat} ({source}): {safe_filename} ({doc['kind']}) ---{caption_line}\n{extracted_text}",
         )
-        if auto_plan_if_waiting and self.lifecycle.get(project_id) == "INPUT_RECEIVED" and not self.db.list_tasks(project_id):
-            self.start_project(project_id)
-        return True, f"Received {original_name} ({size} bytes, {doc['chars']} chars extracted)"
+        summary = (
+            extracted_text[:200]
+            if resolved_cat == "image"
+            else f"Received {safe_filename} ({size} bytes, {doc['chars']} chars extracted)"
+        )
+        rel_stored = str(dest.relative_to(ws))
+        uid = self.db.record_uploaded_artifact(
+            project_id, safe_filename, sha256=digest, source=source,
+            category=resolved_cat, size_bytes=size, stored_path=rel_stored, summary=summary,
+        )
+        self.db.record_sync(project_id, source, "artifact_uploaded", f"{resolved_cat}:{safe_filename}")
+        if auto_plan_if_waiting and self.lifecycle.get(project_id) in ("IDLE", "INPUT_RECEIVED") and not self.db.list_tasks(project_id):
+            self.start_project(project_id, source=source)
+            auto_planned = True
+        self._notify(project_id, f"📎 Uploaded {resolved_cat} ({source}): {safe_filename}")
+        return {
+            "ok": True,
+            "status": 201,
+            "upload_id": uid,
+            "filename": safe_filename,
+            "category": resolved_cat,
+            "kind": doc["kind"],
+            "size_bytes": size,
+            "sha256": digest,
+            "chars_extracted": doc["chars"],
+            "stored_path": rel_stored,
+            "auto_planned": auto_planned,
+            "message": summary,
+        }
+
+    def ingest_upload(self, project_id: str, local_path: str, original_name: str,
+                      *, auto_plan_if_waiting: bool = False,
+                      source: str = "system") -> tuple[bool, str]:
+        """Backward-compatible wrapper returning (ok, message)."""
+        res = self.ingest_upload_detailed(
+            project_id, local_path, original_name,
+            auto_plan_if_waiting=auto_plan_if_waiting, source=source,
+        )
+        if res.get("ok"):
+            return True, str(res.get("message") or "OK")
+        return False, str(res.get("error") or "Upload failed")
 
     def _append_requirements(self, project_id: str, text: str) -> None:
         proj = self.db.get_project(project_id)
@@ -413,13 +597,21 @@ class OrchestratorEngine:
         )
         return any(self.approvals.is_approved(r["id"]) for r in rows)
 
-    def on_approval_decided(self, approval_id: str, approved: bool) -> None:
-        """Resume or fail waiting tasks when a human decides a pending approval."""
+    def on_approval_decided(self, approval_id: str, approved: bool, *, source: str = "system") -> None:
+        """Resume or fail waiting tasks and broadcast synchronized approval decision."""
         row = self.db.get_approval(approval_id)
         if not row:
             return
         pid = row["project_id"]
         tid = row.get("task_id")
+        actor = source or row.get("decided_by") or "system"
+        self.db.record_sync(
+            pid, actor, "approval_approved" if approved else "approval_rejected",
+            f"{approval_id} ({row.get('action', '')})",
+        )
+        if actor in ("dashboard", "android"):
+            verdict = "Approved" if approved else "Rejected"
+            self._notify(pid, f"🔐 {verdict} via {actor}: `{approval_id}` ({row.get('action', '')})")
         if approved:
             if tid:
                 t = self.db.get_task(tid)

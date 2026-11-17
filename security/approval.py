@@ -7,6 +7,7 @@ from memory.database import Database
 # High-impact actions that ALWAYS require explicit human approval at the execution layer.
 DANGEROUS_ACTIONS = {
     "git_push",
+    "pr_merge",
     "public_github_release",
     "deploy",
     "production_deploy",
@@ -124,12 +125,15 @@ class ApprovalManager:
             self.db.log_approval_audit(approval_id, row["project_id"], "VERIFY_FAILED_ACTION_MISMATCH",
                                        actor=actor, detail=f"expected={action} got={row['action']}")
             return False, f"Approval action mismatch ({row['action']} != {action})"
+        if row.get("expires_at") is not None and row["expires_at"] <= time.time():
+            return False, f"Approval {approval_id} has expired"
         if consume:
-            if row.get("consumed_at") is not None:
-                self.db.log_approval_audit(approval_id, row["project_id"], "VERIFY_FAILED_ALREADY_CONSUMED",
+            # Consumption is an atomic conditional update; another request may have
+            # consumed the same approval since the read above.
+            if not self.db.mark_approval_consumed(approval_id, actor=actor):
+                self.db.log_approval_audit(approval_id, row["project_id"], "VERIFY_FAILED_ALREADY_CONSUMED_OR_EXPIRED",
                                            actor=actor, detail=action or "")
-                return False, f"Approval {approval_id} was already consumed"
-            self.db.mark_approval_consumed(approval_id, actor=actor)
+                return False, f"Approval {approval_id} was already consumed or expired"
         else:
             self.db.log_approval_audit(approval_id, row["project_id"], "VERIFIED",
                                        actor=actor, detail=action or row["action"])

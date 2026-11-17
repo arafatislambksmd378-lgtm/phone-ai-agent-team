@@ -8,14 +8,17 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 V4_SCHEMA = """
 CREATE TABLE IF NOT EXISTS github_connections (id TEXT PRIMARY KEY, owner TEXT NOT NULL DEFAULT '', scopes TEXT NOT NULL DEFAULT '', token_ref TEXT NOT NULL DEFAULT 'env:GITHUB_TOKEN', status TEXT NOT NULL DEFAULT 'DISCONNECTED', created_at REAL NOT NULL, updated_at REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS project_repositories (project_id TEXT PRIMARY KEY REFERENCES projects(id), repo_full_name TEXT NOT NULL, owner TEXT NOT NULL, name TEXT NOT NULL, visibility TEXT NOT NULL DEFAULT 'private', default_branch TEXT NOT NULL DEFAULT 'main', working_branch TEXT, connected_at REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS pull_requests (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, repo_full_name TEXT NOT NULL, number INTEGER, title TEXT NOT NULL, head_branch TEXT NOT NULL, base_branch TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'OPEN', url TEXT NOT NULL DEFAULT '', task_id TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
-CREATE TABLE IF NOT EXISTS uploaded_artifacts (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, filename TEXT NOT NULL, sha256 TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT 'dashboard', created_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS project_repositories (project_id TEXT PRIMARY KEY REFERENCES projects(id), repo_full_name TEXT NOT NULL, owner TEXT NOT NULL, name TEXT NOT NULL, visibility TEXT NOT NULL DEFAULT 'private', default_branch TEXT NOT NULL DEFAULT '', working_branch TEXT, connected_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS pull_requests (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, repo_full_name TEXT NOT NULL, number INTEGER, title TEXT NOT NULL, head_branch TEXT NOT NULL, base_branch TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'OPEN', url TEXT NOT NULL DEFAULT '', task_id TEXT, merged_at REAL, merge_commit_sha TEXT, approval_id TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS uploaded_artifacts (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, filename TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'document', size_bytes INTEGER NOT NULL DEFAULT 0, stored_path TEXT NOT NULL DEFAULT '', summary TEXT NOT NULL DEFAULT '', sha256 TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT 'dashboard', created_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS synchronization_events (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id TEXT NOT NULL DEFAULT '', source TEXT NOT NULL, event TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', ts REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS request_idempotency (key TEXT PRIMARY KEY, project_id TEXT NOT NULL DEFAULT '', response_json TEXT NOT NULL, created_at REAL NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_pr_project ON pull_requests(project_id);
+CREATE INDEX IF NOT EXISTS idx_sync_project ON synchronization_events(project_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_uploads_project ON uploaded_artifacts(project_id, created_at DESC);
 """
 
 SCHEMA = """
@@ -136,6 +139,24 @@ class Database:
             usage_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(model_usage)").fetchall()}
             if "project_id" not in usage_cols:
                 self._conn.execute("ALTER TABLE model_usage ADD COLUMN project_id TEXT")
+
+            pr_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(pull_requests)").fetchall()}
+            if "merged_at" not in pr_cols:
+                self._conn.execute("ALTER TABLE pull_requests ADD COLUMN merged_at REAL")
+            if "merge_commit_sha" not in pr_cols:
+                self._conn.execute("ALTER TABLE pull_requests ADD COLUMN merge_commit_sha TEXT")
+            if "approval_id" not in pr_cols:
+                self._conn.execute("ALTER TABLE pull_requests ADD COLUMN approval_id TEXT")
+
+            up_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(uploaded_artifacts)").fetchall()}
+            if "category" not in up_cols:
+                self._conn.execute("ALTER TABLE uploaded_artifacts ADD COLUMN category TEXT NOT NULL DEFAULT 'document'")
+            if "size_bytes" not in up_cols:
+                self._conn.execute("ALTER TABLE uploaded_artifacts ADD COLUMN size_bytes INTEGER NOT NULL DEFAULT 0")
+            if "stored_path" not in up_cols:
+                self._conn.execute("ALTER TABLE uploaded_artifacts ADD COLUMN stored_path TEXT NOT NULL DEFAULT ''")
+            if "summary" not in up_cols:
+                self._conn.execute("ALTER TABLE uploaded_artifacts ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
 
             row = self._conn.execute("SELECT version FROM migrations WHERE version=?", (SCHEMA_VERSION,)).fetchone()
             if not row:
@@ -503,9 +524,14 @@ class Database:
         now = time.time()
         with self._lock:
             row = self._conn.execute("SELECT * FROM approvals WHERE id=?", (aid,)).fetchone()
-            if not row or row["status"] != "APPROVED" or row["consumed_at"] is not None:
+            if not row:
                 return False
-            self._conn.execute("UPDATE approvals SET consumed_at=? WHERE id=?", (now, aid))
+            cur = self._conn.execute(
+                "UPDATE approvals SET consumed_at=? WHERE id=? AND status='APPROVED' "
+                "AND consumed_at IS NULL AND (expires_at IS NULL OR expires_at > ?)",
+                (now, aid, now))
+            if cur.rowcount != 1:
+                return False
             self._conn.execute(
                 "INSERT INTO approval_audit_logs(approval_id,project_id,event,actor,detail,ts) "
                 "VALUES(?,?,?,?,?,?)",
@@ -611,21 +637,208 @@ class Database:
             except Exception:
                 pass
 
-    # ---- v4: multi-project GitHub bindings (isolation enforced here) ----
-    def bind_repository(self, project_id, repo_full_name, visibility="private", default_branch="main", working_branch=None):
-        parts = (repo_full_name or "").strip().split("/")
-        if len(parts) != 2 or not all(parts): raise ValueError("repo must be owner/name")
-        self.execute("INSERT INTO project_repositories(project_id,repo_full_name,owner,name,visibility,default_branch,working_branch,connected_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET repo_full_name=excluded.repo_full_name,owner=excluded.owner,name=excluded.name,visibility=excluded.visibility,default_branch=excluded.default_branch,working_branch=excluded.working_branch", (project_id, repo_full_name, parts[0], parts[1], visibility, default_branch, working_branch, time.time()))
-        self.record_sync(project_id, "system", "repo_bound", repo_full_name)
+    # ---- v4/v5: multi-project GitHub bindings, PRs, uploads, sync & idempotency ----
+    def bind_repository(self, project_id: str, repo_full_name: str, visibility: str = "private",
+                        default_branch: str = "", working_branch: str | None = None) -> dict | None:
+        from security.validation import validate_branch_name, validate_repo_full_name
+        clean_repo = (repo_full_name or "").strip()
+        ok, err = validate_repo_full_name(clean_repo)
+        if not ok:
+            raise ValueError(err)
+        parts = clean_repo.split("/")
+        clean_default = (default_branch or "").strip()
+        if clean_default:
+            ok_b, err_b = validate_branch_name(clean_default)
+            if not ok_b:
+                raise ValueError(err_b)
+        clean_working = (working_branch or "").strip() or (clean_default or None)
+        if clean_working:
+            ok_w, err_w = validate_branch_name(clean_working)
+            if not ok_w:
+                raise ValueError(err_w)
+        vis = visibility if visibility in ("private", "public", "internal") else "private"
+        self.execute(
+            "INSERT INTO project_repositories(project_id,repo_full_name,owner,name,visibility,"
+            "default_branch,working_branch,connected_at) VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(project_id) DO UPDATE SET repo_full_name=excluded.repo_full_name,"
+            "owner=excluded.owner,name=excluded.name,visibility=excluded.visibility,"
+            "default_branch=excluded.default_branch,working_branch=excluded.working_branch",
+            (project_id, clean_repo, parts[0], parts[1], vis, clean_default, clean_working, time.time()),
+        )
+        self.record_sync(project_id, "system", "repo_bound",
+                         f"{clean_repo} (default={clean_default or 'pending'}, working={clean_working or 'pending'})")
         return self.get_repository(project_id)
-    def get_repository(self, project_id): return self.query_one("SELECT * FROM project_repositories WHERE project_id=?", (project_id,))
-    def assert_repo(self, project_id, repo_full_name):
+
+    def set_working_branch(self, project_id: str, working_branch: str,
+                           default_branch: str | None = None, source: str = "dashboard") -> dict | None:
+        from security.validation import validate_branch_name
+        repo = self.get_repository(project_id)
+        if not repo:
+            raise ValueError("No GitHub repository connected to this project")
+        ok, err = validate_branch_name(working_branch)
+        if not ok:
+            raise ValueError(err)
+        clean_w = working_branch.strip()
+        if default_branch is not None and default_branch.strip():
+            ok_d, err_d = validate_branch_name(default_branch)
+            if not ok_d:
+                raise ValueError(err_d)
+            self.execute(
+                "UPDATE project_repositories SET working_branch=?, default_branch=? WHERE project_id=?",
+                (clean_w, default_branch.strip(), project_id),
+            )
+        else:
+            self.execute(
+                "UPDATE project_repositories SET working_branch=? WHERE project_id=?",
+                (clean_w, project_id),
+            )
+        self.record_sync(project_id, source, "branch_selected", clean_w)
+        return self.get_repository(project_id)
+
+    def get_repository(self, project_id: str) -> dict | None:
+        return self.query_one("SELECT * FROM project_repositories WHERE project_id=?", (project_id,))
+
+    def assert_repo(self, project_id: str, repo_full_name: str) -> dict:
         b = self.get_repository(project_id)
-        if not b: raise PermissionError("No GitHub repository connected to this project")
-        if b["repo_full_name"] != repo_full_name: raise PermissionError(f"Repository isolation violation: project bound to {b['repo_full_name']}")
+        if not b:
+            raise PermissionError("No GitHub repository connected to this project")
+        if b["repo_full_name"] != repo_full_name:
+            raise PermissionError(f"Repository isolation violation: project bound to {b['repo_full_name']}")
         return b
-    def record_pull_request(self, project_id, repo, number, title, head, base, url="", task_id=None, state="OPEN"):
-        pid = f"pr_{uuid.uuid4().hex[:12]}"; now=time.time()
-        self.execute("INSERT INTO pull_requests(id,project_id,repo_full_name,number,title,head_branch,base_branch,state,url,task_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (pid,project_id,repo,number,title,head,base,state,url,task_id,now,now)); return pid
-    def list_pull_requests(self, project_id): return self.query("SELECT * FROM pull_requests WHERE project_id=? ORDER BY created_at DESC", (project_id,))
-    def record_sync(self, project_id, source, event, detail=""): self.execute("INSERT INTO synchronization_events(project_id,source,event,detail,ts) VALUES(?,?,?,?,?)", (project_id,source,event,detail,time.time()))
+
+    def record_pull_request(self, project_id: str, repo: str, number: int | None, title: str,
+                            head: str, base: str, url: str = "", task_id: str | None = None,
+                            state: str = "OPEN") -> str:
+        now = time.time()
+        norm_state = (state or "OPEN").upper()
+        if number is not None:
+            existing = self.query_one(
+                "SELECT id FROM pull_requests WHERE project_id=? AND repo_full_name=? AND number=?",
+                (project_id, repo, int(number)),
+            )
+            if existing:
+                self.execute(
+                    "UPDATE pull_requests SET title=?, head_branch=?, base_branch=?, state=?, "
+                    "url=CASE WHEN ?!='' THEN ? ELSE url END, updated_at=? WHERE id=?",
+                    (title, head, base, norm_state, url, url, now, existing["id"]),
+                )
+                return existing["id"]
+        pr_id = f"pr_{uuid.uuid4().hex[:12]}"
+        self.execute(
+            "INSERT INTO pull_requests(id,project_id,repo_full_name,number,title,head_branch,"
+            "base_branch,state,url,task_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (pr_id, project_id, repo, number, title, head, base, norm_state, url, task_id, now, now),
+        )
+        return pr_id
+
+    def update_pull_request_state(self, project_id: str, number: int, state: str, *,
+                                  merge_commit_sha: str | None = None,
+                                  approval_id: str | None = None) -> None:
+        now = time.time()
+        norm = (state or "OPEN").upper()
+        merged_at = now if norm == "MERGED" else None
+        self.execute(
+            "UPDATE pull_requests SET state=?, merged_at=COALESCE(?, merged_at), "
+            "merge_commit_sha=COALESCE(?, merge_commit_sha), approval_id=COALESCE(?, approval_id), "
+            "updated_at=? WHERE project_id=? AND number=?",
+            (norm, merged_at, merge_commit_sha, approval_id, now, project_id, int(number)),
+        )
+
+    def list_pull_requests(self, project_id: str) -> list[dict]:
+        return self.query("SELECT * FROM pull_requests WHERE project_id=? ORDER BY created_at DESC", (project_id,))
+
+    def record_uploaded_artifact(self, project_id: str, filename: str, sha256: str = "",
+                                 source: str = "dashboard", category: str = "document",
+                                 size_bytes: int = 0, stored_path: str = "",
+                                 summary: str = "") -> str:
+        from security.secret_manager import redact
+        uid = f"upl_{uuid.uuid4().hex[:12]}"
+        self.execute(
+            "INSERT INTO uploaded_artifacts(id,project_id,filename,category,size_bytes,stored_path,"
+            "summary,sha256,source,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (uid, project_id, Path(filename).name[:255], category[:40], int(size_bytes or 0),
+             stored_path[:500], redact(summary)[:1000], sha256, source[:40], time.time()),
+        )
+        return uid
+
+    def list_uploaded_artifacts(self, project_id: str, limit: int = 100) -> list[dict]:
+        return self.query(
+            "SELECT * FROM uploaded_artifacts WHERE project_id=? ORDER BY created_at DESC LIMIT ?",
+            (project_id, int(limit)),
+        )
+
+    def list_approvals(self, project_id: str | None = None, status: str | None = None,
+                       limit: int = 100) -> list[dict]:
+        self.expire_approvals()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            clauses.append("project_id=?")
+            params.append(project_id)
+        if status:
+            clauses.append("status=?")
+            params.append(status.upper())
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(int(limit))
+        return self.query(f"SELECT * FROM approvals {where} ORDER BY requested_at DESC LIMIT ?", tuple(params))
+
+    def list_project_logs(self, project_id: str | None = None, *, task_id: str | None = None,
+                          execution_id: str | None = None, limit: int = 100) -> list[dict]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if project_id:
+            clauses.append("e.project_id=?")
+            params.append(project_id)
+        if task_id:
+            clauses.append("e.task_id=?")
+            params.append(task_id)
+        if execution_id:
+            clauses.append("l.execution_id=?")
+            params.append(execution_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(max(1, min(500, int(limit or 100))))
+        rows = self.query(
+            f"SELECT l.id, l.execution_id, e.project_id, e.task_id, e.agent_id, "
+            f"l.level, l.message, l.ts FROM execution_logs l "
+            f"JOIN executions e ON e.id = l.execution_id "
+            f"{where} ORDER BY l.id DESC LIMIT ?",
+            tuple(params),
+        )
+        return list(reversed(rows))
+
+    def record_sync(self, project_id: str, source: str, event: str, detail: str = "") -> None:
+        from security.secret_manager import redact
+        self.execute(
+            "INSERT INTO synchronization_events(project_id,source,event,detail,ts) VALUES(?,?,?,?,?)",
+            (project_id or "", source[:40], event[:80], redact(str(detail))[:1000], time.time()),
+        )
+
+    def list_sync_events(self, project_id: str | None = None, limit: int = 100) -> list[dict]:
+        lim = max(1, min(500, int(limit or 100)))
+        if project_id:
+            return self.query(
+                "SELECT * FROM synchronization_events WHERE project_id=? ORDER BY id DESC LIMIT ?",
+                (project_id, lim),
+            )
+        return self.query("SELECT * FROM synchronization_events ORDER BY id DESC LIMIT ?", (lim,))
+
+    def get_idempotent_response(self, key: str, ttl_seconds: int = 600) -> dict | None:
+        if not key:
+            return None
+        row = self.query_one("SELECT response_json, created_at FROM request_idempotency WHERE key=?", (key[:160],))
+        if not row:
+            return None
+        if time.time() - float(row["created_at"]) > ttl_seconds:
+            return None
+        try:
+            return json.loads(row["response_json"])
+        except Exception:
+            return None
+
+    def save_idempotent_response(self, key: str, project_id: str, response: dict) -> None:
+        if not key:
+            return
+        self.execute(
+            "INSERT OR REPLACE INTO request_idempotency(key,project_id,response_json,created_at) VALUES(?,?,?,?)",
+            (key[:160], project_id or "", json.dumps(response), time.time()),
+        )

@@ -1,0 +1,7 @@
+# Android installation and validation
+
+The Phase 3 APK must be built by the Android APK workflow for the **Phase 3 commit**, not taken from the older Phase 2 PR. Download `app-debug-apk` from that successful GitHub Actions run; verify the run and commit SHA. A debug APK is not a production-signed release. Install using `adb install -r app-debug.apk`, or transfer it to the device and allow installation from that source. Build locally with JDK 17, Android SDK 34, Gradle 8.9: `cd android && gradle testDebugUnitTest assembleDebug`.
+
+Open Settings and enter the HTTPS backend URL and its API bearer token. On Android emulator `http://10.0.2.2:8000` is allowed for local development; on-device loopback refers to that device, not the server. No GitHub token belongs in the app. Create/select a project, connect a dedicated GitHub test repo, select a non-default working branch, submit instructions, browse/edit files, compare branches, review a PR and authorize a merge in Approvals. Delete and merge require confirmation; a stale-file conflict must preserve edits until the user chooses how to resolve them.
+
+No physical device or emulator was available in this environment. All of the above device operations still require validation; a passing CI build alone is not a device test. Existing app settings use Android Keystore and are not backed up. Debug builds are not suitable for production distribution.
