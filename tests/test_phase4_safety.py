@@ -95,3 +95,26 @@ def test_github_redirects_cannot_leak_credentials():
         handler.redirect_request(req, None, 302, "Found", {}, "https://api.github.com.attacker.invalid/user")
     same = handler.redirect_request(req, None, 302, "Found", {}, "https://api.github.com/user/repos")
     assert same.full_url == "https://api.github.com/user/repos"
+
+
+def test_workspace_git_metadata_access_is_rejected(tmp_path):
+    import pytest
+    fm = FileManager(str(tmp_path))
+    for path in (".git/config", ".git/hooks/pre-commit", "nested/.git/hooks/post-commit"):
+        with pytest.raises(PermissionError):
+            fm.write(path, "unsafe")
+        with pytest.raises(PermissionError):
+            fm.read(path)
+
+
+def test_git_checkpoint_never_executes_project_hooks(tmp_path):
+    from execution.sandbox import Sandbox
+    sb = Sandbox(str(tmp_path))
+    assert sb.init_git()
+    hook = tmp_path / ".git/hooks/pre-commit"
+    marker = tmp_path / "hook-ran"
+    hook.write_text("#!/bin/sh\ntouch '" + str(marker) + "'\n")
+    hook.chmod(0o755)
+    (tmp_path / "file.txt").write_text("ok")
+    assert sb.checkpoint_commit("safe checkpoint")
+    assert not marker.exists()
