@@ -21,6 +21,11 @@ jobs:
           cd android
           set -o pipefail
           gradle testDebugUnitTest assembleDebug --no-daemon 2>&1 | tee ../android-build.log
+      - name: Surface build errors
+        if: always()
+        run: |
+          MSG=$(grep -B2 -A8 "What went wrong" android-build.log | head -14 | sed 's/%/%25/g' | sed ':a;N;$!ba;s/\n/%0A/g')
+          echo "::error::${MSG:-no error lines matched}"
       - name: Locate and stage APK
         run: |
           echo "::warning::$(grep -E 'BUILD (SUCCESSFUL|FAILED)' android-build.log | head -1)"
