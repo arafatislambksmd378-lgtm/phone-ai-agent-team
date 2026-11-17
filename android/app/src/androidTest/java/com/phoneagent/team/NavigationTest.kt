@@ -7,8 +7,7 @@ import androidx.test.espresso.assertion.ViewAssertions.matches
 import androidx.test.espresso.matcher.ViewMatchers.*
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import android.graphics.Bitmap
-import java.io.File
+import android.os.ParcelFileDescriptor
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -39,9 +38,8 @@ class NavigationTest {
   private fun screenshot(name: String) {
     val instrumentation = InstrumentationRegistry.getInstrumentation()
     instrumentation.waitForIdleSync()
-    val bitmap = requireNotNull(instrumentation.uiAutomation.takeScreenshot())
-    val dir = File(instrumentation.targetContext.filesDir, "phase41-screenshots").apply { mkdirs() }
-    File(dir, "$name.png").outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
-    bitmap.recycle()
+    // Shell-owned public temporary file survives Gradle uninstalling the test app.
+    val descriptor = instrumentation.uiAutomation.executeShellCommand("screencap -p /sdcard/phase41-$name.png")
+    ParcelFileDescriptor.AutoCloseInputStream(descriptor).use { it.readBytes() }
   }
 }

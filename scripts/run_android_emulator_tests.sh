@@ -15,12 +15,13 @@ print(f'::notice title=Android instrumentation::tests={tests} failures={failures
 PY
 mkdir -p ../emulator-screenshots
 for name in home settings projects; do
-  adb exec-out run-as com.phoneagent.team cat "files/phase41-screenshots/${name}.png" > "../emulator-screenshots/${name}.png"
+  adb exec-out cat "/sdcard/phase41-${name}.png" > "../emulator-screenshots/${name}.png"
   python3 - "../emulator-screenshots/${name}.png" <<'PY'
 import pathlib, struct, sys
 p = pathlib.Path(sys.argv[1]); data = p.read_bytes()
 if len(data) < 10000 or data[:8] != b'\x89PNG\r\n\x1a\n':
-    raise SystemExit(f'{p}: screenshot missing, invalid or unexpectedly small ({len(data)} bytes; prefix {data[:80]!r})')
+    print(f'::error title=Invalid emulator screenshot::{p.name}: {len(data)} bytes; prefix {data[:80]!r}')
+    raise SystemExit(1)
 w, h = struct.unpack('>II', data[16:24])
 if min(w, h) < 320:
     raise SystemExit(f'{p}: unexpected image dimensions {w}x{h}')
