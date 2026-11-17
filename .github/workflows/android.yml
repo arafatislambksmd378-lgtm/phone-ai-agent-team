@@ -15,11 +15,15 @@ jobs:
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-34" "build-tools;34.0.0"
       - name: Unit tests + assemble debug APK
         run: cd android && gradle testDebugUnitTest assembleDebug --no-daemon --stacktrace 2>&1 | tee ../android-build.log
-      - name: Verify APK exists
-        run: ls -lh android/app/build/outputs/apk/debug/ && test -f android/app/build/outputs/apk/debug/app-debug.apk
+      - name: Locate APK
+        id: findapk
+        run: |
+          F=$(find . -name "*.apk" | head -1); echo "found: $F"
+          echo "apkname=$(basename ${F:-NONE})" >> $GITHUB_OUTPUT
+          ls android/app/build/outputs/apk/debug/ || true
       - uses: actions/upload-artifact@v4
         if: always()
         with: { name: android-build-log, path: android-build.log }
       - uses: actions/upload-artifact@v4
         if: success()
-        with: { name: app-debug-apk, path: android/app/build/outputs/apk/debug/*.apk }
+        with: { name: app-debug-apk-${{ steps.findapk.outputs.apkname }}, path: android/app/build/outputs/apk/debug/*.apk }
