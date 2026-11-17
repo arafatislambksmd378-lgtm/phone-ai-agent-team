@@ -96,3 +96,31 @@ def test_merge_requires_exact_pr_repo_scope_and_single_use(tmp_path):
     approvals.approve(old)
     db.bind_repository(pid, "owner/other", "private", "trunk", "topic")
     assert not service.merge(pid, 9, old)["ok"]
+
+
+def test_merge_rejects_different_head_without_consuming(tmp_path):
+    db = Database(tmp_path / "db-head")
+    pid = db.create_project("project", str(tmp_path))
+    db.bind_repository(pid, "owner/repo", "private", "trunk", "topic")
+    api = GitHubAPI("example")
+    api.get_pr = lambda *args: {"ok": True, "data": {"head": {"sha": "a" * 40}}}
+    api.merge_pr = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not merge"))
+    approvals = ApprovalManager(db)
+    service = GitHubExecutionService(db, api, approvals)
+    aid = service.request_merge_approval(pid, 1)["id"]
+    approvals.approve(aid)
+    result = service.merge(pid, 1, aid, sha="b" * 40)
+    assert result["status"] == 409
+    assert approvals.get(aid)["consumed_at"] is None
+
+
+def test_repository_default_is_discovered_not_client_override(tmp_path):
+    db = Database(tmp_path / "db-branch")
+    pid = db.create_project("project", str(tmp_path))
+    api = GitHubAPI("example")
+    api.permissions = lambda repo: {"ok": True, "default_branch": "develop", "permissions": {"push": True}}
+    svc = GitHubExecutionService(db, api)
+    result = svc.connect_repository(pid, "owner/repo", default_branch="wrong")
+    assert result["ok"]
+    assert result["repository"]["default_branch"] == "develop"
+    assert result["repository"]["working_branch"] == "develop"

@@ -11,8 +11,9 @@
 | Branch default discovery, GitHub APIs and file operations | Mock-tested only | No live writes. Full file CRUD/rename and non-default branch combinations need more coverage and device validation. |
 | PR list/detail/review and merge approval | Mock-tested only | Scope, SHA and concurrent single-use approval tests use mocked GitHub; no live PR review or merge. |
 | Dashboard project/task APIs, shared database | Implemented and automated-test-verified | Local HTTP task/history and existing regression tests; full real orchestration, uploads and sync paths require more integration testing. |
-| Android dashboard, uploads, file browser, branches and PR UI | Not tested | Implementation added; unit tests and APK require a successful Phase 3 Android CI run and device validation. UI details and API interoperability remain unverified. |
-| APK and physical device validation | Blocked | No local Android SDK, emulator or physical device. Earlier PR #3 APK is not a Phase 3 artifact. |
+| Android dashboard, uploads, file browser, branches and PR UI | Not tested | Code builds and model unit tests pass in CI, but UI behavior and API interoperability have not been tested on a device. |
+| Android unit tests and debug APK build | Implemented and automated-test-verified | GitHub Actions run 44016902968 passed unit tests and built `app-debug-apk` for commit `5b2da63`. Artifact metadata exists; the sandbox could not download it from GitHub's external artifact storage. This does not verify installation or runtime behavior. |
+| APK installation and physical device validation | Blocked | No local Android SDK, emulator or physical device. No APK was installed or run. |
 | Full real GitHub 10-step execution | Blocked | No live AI provider credential or dedicated authorized test repository was available. Generated test execution is unsafe without external isolation and disabled by default. No live execution claimed. |
 | Telegram bidirectional notifications and approval synchronization | Mock-tested only | Existing local/mock tests; no live bot or end-to-end cross-interface verification. In-process duplicate guards are not distributed exactly-once guarantees. |
 | HTTPS deployment | Not tested | Secure deployment instructions provided; no deployed HTTPS environment tested. |
@@ -20,4 +21,4 @@
 
 ## Tests
 
-Python: `PATH="$PWD/.venv/bin:$PATH" .venv/bin/python -m pytest tests/ -q -o addopts=''`: **178 passed, 4 skipped** locally. The skipped tests are opt-in live integration tests. Python runtime uses the standard library. Android tests/build have not yet been verified in this environment; check the CI run on the latest commit. See `PHASE3_SECURITY_AND_E2E_REPORT.md`, `PHASE3_BACKEND_DEPLOYMENT.md`, and `PHASE3_ANDROID_INSTALLATION.md` for safety boundaries and next steps.
+Python: `PATH="$PWD/.venv/bin:$PATH" .venv/bin/python -m pytest tests/ -q -o addopts=''`: **180 passed, 4 skipped** locally. The skipped tests are opt-in live integration tests. Python CI and Android unit/build CI passed on commit `5b2da63`. The APK artifact is available on [the Android Actions run](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/actions/runs/44016902968); download was blocked in this sandbox, so the APK itself was not independently inspected. Check CI on the latest commit. See `PHASE3_SECURITY_AND_E2E_REPORT.md`, `PHASE3_BACKEND_DEPLOYMENT.md`, and `PHASE3_ANDROID_INSTALLATION.md` for safety boundaries and next steps.

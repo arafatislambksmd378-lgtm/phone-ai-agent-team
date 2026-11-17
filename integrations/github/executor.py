@@ -63,7 +63,8 @@ class GitHubExecutionService:
             if meta.get("ok"):
                 remote_verified = True
                 permissions = meta.get("permissions") or {}
-                if not resolved_default and meta.get("default_branch"):
+                if meta.get("default_branch"):
+                    # GitHub's configured default is authoritative, not a client override.
                     resolved_default = str(meta["default_branch"]).strip()
                 if not resolved_vis:
                     resolved_vis = str(meta.get("visibility") or ("private" if meta.get("private") else "public"))
@@ -1144,6 +1145,10 @@ class GitHubExecutionService:
         )
         if not commit_res.get("ok"):
             return commit_res
+        if not commit_res.get("verified"):
+            return {"ok": False, "status": 502, "branch": target_branch,
+                    "committed_files": list(generated_files), "tests": test_summary,
+                    "error": "Writes were attempted but GitHub comparison did not verify all files; no PR was opened"}
 
         self.db.set_working_branch(project_id, target_branch, source=source)
 
