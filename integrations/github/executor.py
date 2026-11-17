@@ -27,3 +27,20 @@ class GitHubExecutionService:
             ok, why = self.approvals.verify(approval_id, project_id=project_id, action="git_push", consume=True)
             if not ok: return {"ok": False, "error": f"Merge blocked: {why}"}
         return self.api.merge_pr(b["repo_full_name"], number)
+
+    def save_user_file(self, project_id, branch, path, content, sha=None, message=None):
+        """User edit from Android: stale-SHA conflicts surface, never overwrite silently."""
+        b = self.db.assert_repo(project_id, self.db.get_repository(project_id)["repo_full_name"])
+        return self.api.put_file(b["repo_full_name"], path, content, message or f"user edit {path}", branch, sha)
+    def execute_agent_files(self, project_id, task_id, agent_id, branch, files: dict):
+        """Commit real agent file outputs, then verify via compare that exactly those files changed."""
+        b = self.db.assert_repo(project_id, self.db.get_repository(project_id)["repo_full_name"])
+        results = {}
+        for path, content in files.items():
+            r = self.commit_file(project_id, task_id, agent_id, branch, path, content)
+            results[path] = r
+            if not r.get("ok"): return {"ok": False, "error": f"commit failed for {path}", "results": results}
+        cmp = self.api.compare(b["repo_full_name"], b["default_branch"], branch)
+        changed = [f.get("filename") for f in cmp.get("data", {}).get("files", [])] if cmp.get("ok") else []
+        verified = set(files) <= set(changed) if cmp.get("ok") else False
+        return {"ok": True, "verified": verified, "changed_files": changed, "results": results}
