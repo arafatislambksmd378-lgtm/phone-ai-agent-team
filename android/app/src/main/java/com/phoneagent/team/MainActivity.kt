@@ -107,12 +107,12 @@ class MainActivity : AppCompatActivity() {
     Thread {
       try {
         val result = work()
-        runOnUiThread { if (generation == screenGeneration) { status.text = "Connected"; done(result) } }
+        runOnUiThread { if (generation == screenGeneration) { status.text = "Backend responded"; status.setTextColor(Color.rgb(31, 132, 98)); done(result) } }
       } catch (e: Exception) {
         runOnUiThread {
           if (generation == screenGeneration) {
             val note = if (e is ApiException && e.conflict) "Conflict: remote file changed. Your edits are preserved; reload only after copying them." else "Unavailable: ${e.message}"
-            status.text = note; toast(note)
+            status.text = note; status.setTextColor(Color.rgb(165, 73, 74)); toast(note)
           }
         }
       }
@@ -232,7 +232,11 @@ class MainActivity : AppCompatActivity() {
     if (projectId.isBlank()) { section("Get started"); line("Select a project to submit instructions, upload files, and view task history."); return }
     section("Selected project")
     line("Project ID: $projectId")
-    line("Test and command execution is blocked until a secure isolated worker is available; tasks that require it may fail.")
+    body.addView(TextView(this).apply {
+      text = "Execution safety: tests and commands are blocked until an isolated worker is available. Tasks requiring them may fail."
+      textSize = 13f; setTextColor(Color.rgb(110, 81, 24)); background = shape(Color.rgb(255, 248, 222), 14)
+      setPadding(dp(14), dp(12), dp(14), dp(12))
+    })
     val instruction = input("Describe the development task or blueprint").apply { minLines = 4 }
     button("Submit blueprint / instructions") {
       val text = instruction.text.toString().trim()

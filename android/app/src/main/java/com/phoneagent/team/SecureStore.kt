@@ -39,6 +39,7 @@ class SecureStore(ctx: Context) {
   fun save(name: String, value: String) {
     if (value.isEmpty()) {
       prefs.edit().remove(name).apply()
+      legacyPrefs.edit().remove(name).apply()
       return
     }
     val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -55,7 +56,7 @@ class SecureStore(ctx: Context) {
       val parts = raw.split(":", limit = 2)
       if (parts.size != 2) return default
       val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-      val spec = GCMParameterSpec(128, Base64.decode(parts[0], Base64.NO_WRAP))
+      val spec = GCMParameterSpec(128, Base64.decode(parts[0], Base64.DEFAULT))
       cipher.init(Cipher.DECRYPT_MODE, key(), spec)
       val value = String(cipher.doFinal(Base64.decode(parts[1], Base64.DEFAULT)), Charsets.UTF_8)
       if (fromLegacy) save(name, value)
@@ -67,6 +68,7 @@ class SecureStore(ctx: Context) {
 
   fun remove(name: String) {
     prefs.edit().remove(name).apply()
+    legacyPrefs.edit().remove(name).apply()
   }
 
   companion object {

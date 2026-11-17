@@ -82,3 +82,16 @@ def test_github_discovery_http_is_authenticated_and_uses_server_credential(tmp_p
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+def test_github_redirects_cannot_leak_credentials():
+    import urllib.error
+    import urllib.request
+    import pytest
+    from integrations.github.api import _SameOriginRedirect
+    handler = _SameOriginRedirect("https://api.github.com")
+    req = urllib.request.Request("https://api.github.com/user", headers={"Authorization": "Bearer hidden"})
+    with pytest.raises(urllib.error.HTTPError):
+        handler.redirect_request(req, None, 302, "Found", {}, "https://api.github.com.attacker.invalid/user")
+    same = handler.redirect_request(req, None, 302, "Found", {}, "https://api.github.com/user/repos")
+    assert same.full_url == "https://api.github.com/user/repos"

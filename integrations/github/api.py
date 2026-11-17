@@ -65,12 +65,26 @@ def _parse_pr_number(number) -> tuple[bool, int | str]:
     return True, n
 
 
+class _SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    """Prevent a GitHub response from forwarding backend credentials to another host."""
+    def __init__(self, base: str):
+        super().__init__()
+        self.origin = urllib.parse.urlsplit(base)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        dest = urllib.parse.urlsplit(newurl)
+        if (dest.scheme != self.origin.scheme or dest.netloc != self.origin.netloc
+                or dest.username or dest.password):
+            raise urllib.error.HTTPError(req.full_url, 403, "Cross-origin redirect refused", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 class GitHubAPI:
     def __init__(self, token: str = "", opener=None, base: str = "https://api.github.com",
                  max_retries: int = 3, sleeper=time.sleep):
         self.token = (token or "").strip()
         self.base = base.rstrip("/")
-        self._opener = opener or urllib.request.urlopen
+        self._opener = opener or urllib.request.build_opener(_SameOriginRedirect(self.base)).open
         self.max_retries = max(0, int(max_retries))
         self._sleep = sleeper
 
