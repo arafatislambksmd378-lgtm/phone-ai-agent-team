@@ -53,12 +53,17 @@ class CommandRunner:
             elif not approved:
                 return {"ok": False, "error": "Requires human approval", "stdout": "", "stderr": "",
                         "needs_approval": True}
-        # A command allowlist and an approval do not isolate untrusted code or files.
-        # Fail closed until this call is delegated to a verified isolated worker.
-        from execution.isolation import isolated_worker_available, BLOCKED_MESSAGE
-        if not isolated_worker_available():
+        # An allowlist and an approval do not isolate untrusted code: execution is
+        # delegated to a verified isolated worker, or refused.
+        from execution.isolation import executor, BLOCKED_MESSAGE
+        worker = executor()
+        if worker is None:
             return {"ok": False, "blocked": True, "stdout": "", "stderr": "",
-                    "error": BLOCKED_MESSAGE}
+                    "error": BLOCKED_MESSAGE, "executor": "blocked"}
+        if not self.project_id:
+            return {"ok": False, "blocked": True, "stdout": "", "stderr": "",
+                    "error": "Isolated execution requires a project context",
+                    "executor": "blocked"}
         try:
             parts = shlex.split(command)
         except ValueError as e:
@@ -66,31 +71,25 @@ class CommandRunner:
         if not parts:
             return {"ok": False, "error": "Empty command", "stdout": "", "stderr": ""}
         try:
-            if self.process_manager is not None:
-                raw = self.process_manager.run_managed(
-                    f"cmd_{time.monotonic_ns()}", parts, cwd=self.workspace,
-                    timeout=self.timeout, env=_safe_env(),
-                )
-                if "returncode" in raw:
-                    return {
-                        "ok": raw["ok"],
-                        "returncode": raw["returncode"],
-                        "stdout": redact(raw.get("stdout", "")[-MAX_OUTPUT:]),
-                        "stderr": redact(raw.get("stderr", "")[-MAX_OUTPUT:]),
-                    }
-                return {"ok": False, "error": redact(raw.get("error", "Command failed")),
-                        "stdout": "", "stderr": ""}
-            proc = subprocess.run(parts, cwd=self.workspace, capture_output=True, text=True,
-                                  timeout=self.timeout, env=_safe_env())
-            return {"ok": proc.returncode == 0, "returncode": proc.returncode,
-                    "stdout": redact(proc.stdout[-MAX_OUTPUT:]),
-                    "stderr": redact(proc.stderr[-MAX_OUTPUT:])}
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "error": f"Timeout after {self.timeout}s", "stdout": "", "stderr": ""}
-        except FileNotFoundError:
-            return {"ok": False, "error": f"Program not found: {parts[0]}", "stdout": "", "stderr": ""}
-        except Exception as e:
-            return {"ok": False, "error": redact(str(e)), "stdout": "", "stderr": ""}
+            raw = worker.run_command(
+                project_id=self.project_id, workspace=self.workspace,
+                command=parts, timeout_seconds=self.timeout,
+            )
+        except Exception as e:  # pragma: no cover - transport failure
+            return {"ok": False, "error": f"isolated worker failed: {e}",
+                    "stdout": "", "stderr": "", "executor": "isolated_worker"}
+        if raw.get("timed_out"):
+            return {"ok": False, "error": f"Timeout after {self.timeout}s",
+                    "stdout": "", "stderr": "", "executor": "isolated_worker"}
+        return {
+            "ok": bool(raw.get("ok")),
+            "returncode": raw.get("exit_code"),
+            "stdout": redact((raw.get("stdout") or "")[-MAX_OUTPUT:]),
+            "stderr": redact((raw.get("stderr") or "")[-MAX_OUTPUT:]),
+            "executor": "isolated_worker",
+            "isolated": bool((raw.get("isolation") or {}).get("verified")),
+            **({"error": redact(raw.get("error", ""))[:300]} if not raw.get("ok") and raw.get("error") else {}),
+        }
 
 
 def _safe_env() -> dict:

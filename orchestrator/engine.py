@@ -496,6 +496,7 @@ class OrchestratorEngine:
             file_manager=fm,
             approval_manager=self.approvals,
             process_manager=self.resources.processes,
+            project_id=pid,
         )
 
         eid = self.db.start_execution(pid, tid, agent_id)

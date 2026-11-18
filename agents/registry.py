@@ -43,8 +43,9 @@ AGENT_NAMES: dict[str, str] = {
 
 class AgentRegistry:
     def __init__(self, workspace: str = ".", ai_router=None, db=None, file_manager=None,
-                 approval_manager=None, process_manager=None):
+                 approval_manager=None, process_manager=None, project_id: str = ""):
         self.workspace = workspace
+        self.project_id = project_id
         self.ai = ai_router
         self.db = db
         self.fm = file_manager
@@ -73,6 +74,7 @@ class AgentRegistry:
             file_manager=self.fm,
             approval_manager=self.approval_manager,
             process_manager=self.process_manager,
+            project_id=self.project_id,
         )
         self._cache[agent_id] = inst
         return inst
