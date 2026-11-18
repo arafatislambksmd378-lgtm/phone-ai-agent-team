@@ -196,20 +196,20 @@ class Agent(BaseAgent):
 
     def _run_pytest(self, targets: list[str]) -> tuple[bool, str]:
         self._require_tool("run_command")
-        # Do not run untrusted workspace code on the service host.
-        from execution.isolation import isolated_worker_available, BLOCKED_MESSAGE
-        if not isolated_worker_available():
+        # Do not run untrusted workspace code on the service host: only a
+        # verified isolated worker may execute project tests.
+        from execution.isolation import executor, isolated_worker_available
+        worker = executor() if isolated_worker_available() else None
+        if worker is None or not self.project_id:
+            from execution.isolation import BLOCKED_MESSAGE
             return False, BLOCKED_MESSAGE
-        cmd = [sys.executable, "-m", "pytest", "-q", *targets]
-        env = {k: v for k, v in os.environ.items() if k in ("PATH", "HOME", "LANG", "TMPDIR", "PREFIX", "PYTHONPATH")}
-        env["PYTHONDONTWRITEBYTECODE"] = "1"
         try:
-            if self.process_manager is not None:
-                res = self.process_manager.run_managed("debugger_pytest", cmd, cwd=self.workspace, timeout=180, env=env)
-                out = ((res.get("stdout") or "")[-2500:] + (res.get("stderr") or "")[-1000:]).strip()
-                return bool(res.get("ok")), out
-            proc = subprocess.run(cmd, cwd=self.workspace, capture_output=True, text=True, timeout=180, env=env)
-            out = ((proc.stdout or "")[-2500:] + (proc.stderr or "")[-1000:]).strip()
-            return proc.returncode == 0, out
-        except Exception as e:
-            return False, f"pytest execution error: {e}"
+            result = worker.run_pytest(
+                project_id=self.project_id, workspace=self.workspace,
+                target=" ".join(targets) if targets else "tests", timeout_seconds=180,
+            )
+        except Exception as exc:  # pragma: no cover - transport failure
+            return False, f"isolated worker failed: {type(exc).__name__}: {exc}"
+        output = ((result.get("stdout") or "")[-2500:]
+                  + (result.get("stderr") or "")[-1000:]).strip()
+        return bool(result.get("ok")), output

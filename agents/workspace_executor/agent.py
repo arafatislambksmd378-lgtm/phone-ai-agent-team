@@ -40,6 +40,7 @@ class Agent(BaseAgent):
         )
         result = runner.run(command, approved=approved_flag, approval_id=approval_id)
         result["command"] = command
+        result["executor"] = "isolated_worker" if result.get("isolated") else result.get("executor", "blocked")
 
         fallback_lines = [
             "# Workspace Log",

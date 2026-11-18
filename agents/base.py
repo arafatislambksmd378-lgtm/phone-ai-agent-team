@@ -57,8 +57,9 @@ class BaseAgent:
     max_ai_retries: int = 1
 
     def __init__(self, workspace: str = ".", ai_router=None, db=None, file_manager=None,
-                 approval_manager=None, process_manager=None):
+                 approval_manager=None, process_manager=None, project_id: str = ""):
         self.workspace = workspace
+        self.project_id = project_id
         self.ai = ai_router
         self.db = db
         self.fm = file_manager
@@ -89,6 +90,9 @@ class BaseAgent:
     def run(self, task: dict) -> AgentResult:
         eid = str(task.get("execution_id") or "")
         t0 = time.time()
+        # Per-task project association: isolated execution is quota-scoped per
+        # project, so every agent must carry the id it is acting for.
+        self.project_id = str(task.get("project_id") or self.project_id or "")
         payload = self._payload(task)
         valid_in, in_err = self.validate_input(task, payload)
         if not valid_in:

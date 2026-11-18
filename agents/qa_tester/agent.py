@@ -320,11 +320,29 @@ class Agent(BaseAgent):
 
     def _run_pytest(self, test_rel: str) -> tuple[bool, str, str]:
         self._require_tool("run_command")
-        # Project tests execute arbitrary code. No verified isolated worker is wired yet.
-        from execution.isolation import isolated_worker_available, BLOCKED_MESSAGE
-        if not isolated_worker_available():
+        # Project tests execute arbitrary code: only a verified isolated worker
+        # may run them. Everything else stays fail-closed.
+        from execution.isolation import executor, isolated_worker_available
+        worker = executor() if isolated_worker_available() else None
+        if worker is None:
+            from execution.isolation import BLOCKED_MESSAGE
             return False, "BLOCKED", BLOCKED_MESSAGE
         target = "tests" if self._exists("tests") else test_rel
+        project_id = str(self.project_id or "")
+        if project_id:
+            try:
+                result = worker.run_pytest(
+                    project_id=project_id, workspace=self.workspace,
+                    target=target, timeout_seconds=180,
+                )
+            except Exception as exc:  # pragma: no cover - worker transport failure
+                return False, "NOT RUN", f"isolated worker failed: {type(exc).__name__}: {exc}"
+            if result.get("timed_out"):
+                return False, "TIMEOUT", "pytest timed out inside the isolated worker"
+            output = ((result.get("stdout") or "")[-3000:]
+                      + (result.get("stderr") or "")[-1000:]).strip()
+            ok = bool(result.get("ok"))
+            return ok, ("PASSED" if ok else "FAILED"), output
         cmd = [sys.executable, "-m", "pytest", "-q", target]
         try:
             if self.process_manager is not None:
