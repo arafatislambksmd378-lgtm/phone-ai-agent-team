@@ -75,8 +75,10 @@ jobs:
         run: |
           failed=0
           for id in $COMMENT_IDS; do
-            if ! gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/$id" >/dev/null 2>&1; then
+            if ! response=$(gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/$id" 2>&1); then
               failed=$((failed + 1))
+              status=$(printf '%s' "$response" | grep -oE 'HTTP [0-9]{3}' | tail -1)
+              echo "delete failed: ${status:-unknown status} (comment id withheld)"
             fi
           done
           echo "cleanup attempted; failures=$failed (comment ids withheld from logs)"

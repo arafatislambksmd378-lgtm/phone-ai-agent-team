@@ -50,10 +50,19 @@ class RecordingBot(TelegramBot):
         return result
 
     def clear_inline_buttons(self, chat_id, message_id):
+        # Synthetic message ids from injected updates are unknown to Telegram (HTTP 400).
+        # Record locally; the shared-state transition is still real.
+        if int(message_id or 0) == 4242:
+            return {"ok": True, "result": True, "local_record": True}
         return self._checked(super().clear_inline_buttons(chat_id, message_id),
                              "editMessageReplyMarkup")
 
     def answer_callback_query(self, callback_query_id, text="", show_alert=False):
+        if str(callback_query_id).startswith("cb-live-"):
+            # A real acknowledgement requires a real button press; synthetic callback
+            # query ids are rejected by Telegram. Record locally, never claim delivery.
+            self.answers.append(str(text))
+            return {"ok": True, "result": True, "local_record": True}
         result = self._checked(
             super().answer_callback_query(callback_query_id, text, show_alert),
             "answerCallbackQuery")
@@ -272,16 +281,18 @@ def main() -> int:
     step("Android-created project visible in Telegram", android_to_telegram)
     step("Telegram-created project visible via Android API", telegram_to_android)
     step("task cancel sync (Android API → Telegram → API)", task_sync)
-    step("inline approval callback sync", approval_callback)
-    step("duplicate callback protection", duplicate_callback)
-    step("unauthorized callback rejected", unauthorized_callback)
+    step("inline approval callback sync (state real, ack local)", approval_callback)
+    step("duplicate callback protection (local ack)", duplicate_callback)
+    step("unauthorized callback rejected (local ack)", unauthorized_callback)
     step("artifact delivery + shared memory/activity", artifact_and_memory)
     step("/build execution (optional)", optional_build)
 
     lines = ["# Live Telegram / Android synchronization verification", "",
              f"Bot username: @{state.get('bot_username', 'unknown')} (from real getMe)", "",
-             "Messages were sent to the authorized owner chat. Transport was real;",
-             "incoming updates were synthetic to keep the test deterministic.", ""]
+             "Messages and artifact delivery used the real Bot API. Incoming updates were",
+             "synthetic to keep the test deterministic. Callback acknowledgements for",
+             "synthetic callback ids were recorded locally, NOT delivered by Telegram;",
+             "approval/authorization state transitions were real.", ""]
     for name, passed, detail in RESULTS:
         lines.append(f"- {'PASS' if passed else 'FAIL'} {name}: {detail}")
     (OUT / "telegram.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
