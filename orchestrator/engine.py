@@ -40,7 +40,10 @@ class OrchestratorEngine:
         self.settings = settings
         settings.ensure_dirs()
         self.db = Database(settings.db_path)
-        self.memory = ProjectMemory(self.db)
+        self.memory = ProjectMemory(
+            self.db,
+            max_versions=getattr(settings, "memory_versions_per_key", 25),
+        )
         self.lifecycle = LifecycleManager(self.db)
         self.resources = ResourceManager(
             workspace_root=settings.workspace_root,
@@ -246,7 +249,8 @@ class OrchestratorEngine:
     def create_single_task(self, project_id: str, agent_id: str, title: str,
                            instruction: str = "", *, priority: int = 100,
                            depends_on: list[str] | None = None,
-                           auto_run: bool = True, source: str = "dashboard") -> dict:
+                           auto_run: bool = True, source: str = "dashboard",
+                           idempotency_key: str = "") -> dict:
         """Create (idempotently per project+agent+title) a task and optionally run it."""
         proj = self.db.get_project(project_id)
         if not proj:
@@ -257,10 +261,17 @@ class OrchestratorEngine:
         if not clean_title:
             return {"ok": False, "status": 400, "error": "Task title is required"}
         with self._lock_for_project(project_id):
-            existing = self.db.query_one(
-                "SELECT id, status FROM tasks WHERE project_id=? AND agent_id=? AND title=?",
-                (project_id, agent_id, clean_title[:200]),
-            )
+            existing = None
+            if idempotency_key:
+                existing = self.db.query_one(
+                    "SELECT id, status FROM tasks WHERE project_id=? AND idempotency_key=?",
+                    (project_id, idempotency_key[:160]),
+                )
+            if not existing:
+                existing = self.db.query_one(
+                    "SELECT id, status FROM tasks WHERE project_id=? AND agent_id=? AND title=?",
+                    (project_id, agent_id, clean_title[:200]),
+                )
             if existing:
                 return {
                     "ok": True,
@@ -283,7 +294,7 @@ class OrchestratorEngine:
             tid = self.db.create_task(
                 project_id, agent_id, clean_title[:200], payload=payload,
                 priority=max(1, min(1000, int(priority or 100))),
-                depends_on=depends_on,
+                depends_on=depends_on, idempotency_key=idempotency_key,
             )
             self.db.record_sync(project_id, source, "task_created", f"{tid} ({agent_id}: {clean_title[:80]})")
             cur_lc = self.lifecycle.get(project_id)
@@ -456,6 +467,11 @@ class OrchestratorEngine:
         if not proj:
             self.db.set_task_status(tid, "FAILED", error="Project not found")
             return
+        if self.db.is_task_cancel_requested(tid):
+            self.db.set_task_status(tid, "CANCELLED", error="Cancelled by owner before execution")
+            self._notify(pid, f"⛔ {agent_id}: task {tid} cancelled before execution.")
+            self._maybe_finish_project(pid)
+            return
 
         # 1. Android Resource Manager admission check
         res_ok, res_msg, _ = self.resources.check_resources_for_task()
@@ -534,6 +550,16 @@ class OrchestratorEngine:
         finally:
             self.resources.post_task_housekeeping(ws)
 
+        # A persisted cancel request wins over a completed agent run: no handoff,
+        # no checkpoint and no downstream task may be published after cancellation.
+        if self.db.is_task_cancel_requested(tid):
+            self.db.finish_execution(eid, "CANCELLED", error="Cancelled by owner during execution")
+            self.db.set_task_status(tid, "CANCELLED", error="Cancelled by owner during execution")
+            self.db.update_agent_status(agent_id, AGENT_NAMES.get(agent_id, agent_id), "IDLE")
+            self._notify(pid, f"⛔ {agent_id}: task {tid} cancelled; result discarded.")
+            self._maybe_finish_project(pid)
+            return
+
         elapsed_s = time.time() - started
         elapsed_ms = int(elapsed_s * 1000)
 
@@ -564,6 +590,12 @@ class OrchestratorEngine:
             self.db.finish_execution(eid, "COMPLETED")
             self.db.update_agent_status(agent_id, AGENT_NAMES.get(agent_id, agent_id), "IDLE")
             self.db.log(eid, "INFO", f"{agent_id} ok in {elapsed_ms}ms: {result.summary}")
+            try:
+                self.memory.remember_entry(
+                    pid, "task_result", tid, result.summary or "(no summary)",
+                    source=agent_id, task_id=tid)
+            except Exception:
+                log.debug("could not persist task_result memory", exc_info=True)
             self._notify(pid, f"✓ {agent_id}: {result.summary}")
             sha = Sandbox(ws).checkpoint_commit(f"{agent_id}: {task['title']}")
             if sha:
@@ -580,9 +612,26 @@ class OrchestratorEngine:
             self.db.finish_execution(eid, "FAILED", error=reason)
             self.db.update_agent_status(agent_id, AGENT_NAMES.get(agent_id, agent_id), "IDLE")
             self.db.log(eid, "ERROR", f"{agent_id} failed: {reason}")
+            try:
+                self.memory.remember_entry(
+                    pid, "task_failure", tid, reason,
+                    source=agent_id, task_id=tid)
+            except Exception:
+                log.debug("could not persist task_failure memory", exc_info=True)
             if n < max_retries:
-                self.db.set_task_status(tid, "QUEUED", error=reason)
-                self._notify(pid, f"↻ {agent_id} retry {n}/{max_retries}: {reason[:200]}")
+                # Deterministic exponential backoff: the queue will not claim the
+                # task again before not_before, avoiding API/GitHub retry storms.
+                base = max(1, int(getattr(self.settings, "retry_backoff_base_seconds", 2)))
+                ceiling = max(base, int(getattr(self.settings, "retry_backoff_max_seconds", 300)))
+                delay = min(ceiling, base ** max(0, n - 1))
+                scheduled = self.db.requeue_with_backoff(tid, delay, reason)
+                if not scheduled:  # task was finalised concurrently (e.g. owner cancelled)
+                    self._maybe_finish_project(pid)
+                    return
+                self._notify(
+                    pid,
+                    f"↻ {agent_id} retry {n}/{max_retries} in {delay}s: {reason[:200]}",
+                )
             else:
                 self.db.set_task_status(tid, "FAILED", error=reason)
                 skipped = self.handoffs.propagate_failure(pid)
@@ -664,6 +713,7 @@ class OrchestratorEngine:
             if state in ("COMPLETED", "CANCELLED"):
                 return False
             failed = [t for t in tasks if t["status"] == "FAILED"]
+            cancelled = [t for t in tasks if t["status"] == "CANCELLED"]
             pending_approvals = self.db.pending_approvals(pid)
             if pending_approvals:
                 if state in ("QUEUED", "TESTING", "REVIEWING"):
@@ -676,6 +726,15 @@ class OrchestratorEngine:
                     self.lifecycle.set(pid, "EXECUTING")
                 if self.lifecycle.set(pid, "FAILED"):
                     self._notify(pid, f"Project FAILED ({len(failed)} task(s)). Use /recover to retry.")
+            elif cancelled:
+                # Owner cancellation must never be reported as a successful delivery.
+                if state in ("QUEUED", "TESTING", "REVIEWING"):
+                    self.lifecycle.set(pid, "EXECUTING")
+                if self.lifecycle.set(pid, "CANCELLED"):
+                    self._notify(
+                        pid,
+                        f"Project CANCELLED ({len(cancelled)} task(s) cancelled by the owner).",
+                    )
             else:
                 for intermediate in ("EXECUTING", "TESTING", "REVIEWING"):
                     if self.lifecycle.get(pid) == intermediate:
@@ -703,6 +762,42 @@ class OrchestratorEngine:
                 log.debug("completion callback failed", exc_info=True)
         return True
 
+    # ---------- durable per-task control ----------
+    def control_task(self, project_id: str, task_id: str, action: str,
+                     *, actor: str = "system") -> dict:
+        """Cancel/retry/resume one task through the shared, audited backend."""
+        task = self.db.get_task(task_id)
+        if not task or task["project_id"] != project_id:
+            return {"ok": False, "status": 404, "error": "Task not found in this project"}
+        action = str(action).strip().lower()
+        with self._lock_for_project(project_id):
+            if action == "cancel":
+                result = self.db.request_task_cancel(task_id, actor=actor)
+            elif action in ("retry", "resume"):
+                result = self.db.requeue_task(task_id, action, actor=actor)
+            else:
+                return {"ok": False, "status": 400,
+                        "error": "action must be one of cancel, retry, resume"}
+        if not result.get("ok"):
+            return {"ok": False, "status": 409, **result}
+        self.db.record_sync(
+            project_id, actor, f"task_{action}",
+            f"{task_id} ({task['agent_id']}): {result.get('status', '')}",
+        )
+        if result.get("status") == "QUEUED":
+            self.lifecycle.set(project_id, "QUEUED")
+            self.scheduler.start()
+        elif action == "cancel" and result.get("effective") == "cancelled":
+            state = self.lifecycle.get(project_id)
+            if state in ("QUEUED", "EXECUTING", "TESTING", "REVIEWING"):
+                self.lifecycle.set(project_id, "EXECUTING")
+            self._maybe_finish_project(project_id)
+        self._notify(
+            project_id,
+            f"🎛 {actor} {action}d task {task_id} ({task['agent_id']}): {result.get('status')}",
+        )
+        return {"ok": True, "status": 200, "task_id": task_id, **result}
+
     # ---------- control & reporting ----------
     def status(self, project_id: str) -> dict:
         proj = self.db.get_project(project_id)
@@ -721,6 +816,8 @@ class OrchestratorEngine:
                     "summary": t.get("result") or "",
                     "error": t["error"],
                     "retries": t["retries"],
+                    "cancel_requested": bool(t.get("cancel_requested", 0)),
+                    "not_before": t.get("not_before", 0),
                 }
                 for t in tasks
             ],
@@ -750,6 +847,11 @@ class OrchestratorEngine:
 
     def cancel(self, project_id: str) -> None:
         self._cancelled.add(project_id)
+        # Persist the intent as well: a restarted backend must not reclaim work
+        # that the owner cancelled in a previous process.
+        self.db.execute(
+            "UPDATE tasks SET cancel_requested=1 WHERE project_id=? "
+            "AND status IN ('QUEUED','EXECUTING')", (project_id,))
         for t in self.db.list_tasks(project_id):
             if t["status"] in ("QUEUED", "EXECUTING"):
                 self.db.set_task_status(t["id"], "CANCELLED", error="Project cancelled")

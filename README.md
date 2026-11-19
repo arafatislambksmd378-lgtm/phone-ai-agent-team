@@ -85,3 +85,6 @@ phone-ai-agent-team/
 
 ## GitHub-Centric Platform (v3)
 Android app (`android/`, built by GitHub Actions — never on-device) + Telegram both use the shared JSON API: `API_AUTH_TOKEN=x python3 main.py --api --api-port 8000`. Each project binds its own GitHub repo (`POST /api/projects/{id}/repository`); agents work on `agent/<project>/<task>` branches and open PRs via `integrations/github/` — merges are approval-gated and cross-project repo access is rejected. Set `GITHUB_TOKEN` (fine-grained: Contents+Pull requests RW on selected repos); without it remote calls fail honestly, nothing is simulated. See `docs/architecture/` and `docs/implementation/`.
+
+## Durable task control and project memory (schema v6)
+The Android Tasks screen, the API and Telegram `/task <id> [cancel|retry|resume]` all act on the same persisted task row. Cancellation survives a backend restart, retries use exponential backoff (`RETRY_BACKOFF_BASE_SECONDS`, `RETRY_BACKOFF_MAX_SECONDS`), completed tasks cannot be re-run, and control requests accept an `idempotency_key`. Structured project knowledge is versioned, deduplicated, searchable and project-scoped via `GET/POST /api/projects/{id}/memory` and the Android Memory screen (`MEMORY_VERSIONS_PER_KEY` controls retention). See `docs/IMPLEMENTATION_STATUS.md` and `docs/REPOSITORY_GAP_ANALYSIS.md`.

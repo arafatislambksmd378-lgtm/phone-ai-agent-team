@@ -84,3 +84,16 @@ This roadmap governs the 11-phase engineering upgrade of `phone-ai-agent-team` f
 ## Phase 11: Full Integration, Regression Testing & Readiness Assessment
 - Comprehensive unit, contract, security, persistence, recovery, resource, Git, Telegram, dynamic planner, multi-category workflow, and end-to-end tests (+ separate opt-in live provider integration test module).
 - Run full test suite, CLI self-checks, and offline multi-category demos; record exact verified metrics and honest status labels.
+
+---
+
+## Phase 12 — Master-prompt gap remediation (executed 2026-11-19)
+
+1. **Inspection** — current `origin/main` (`eec0f11`) integrated into this branch; no earlier audit trusted.
+2. **Gap analysis** — `docs/REPOSITORY_GAP_ANALYSIS.md` (10 gaps, P0→P3).
+3. **P0 fixes** — persisted cancellation and exponential retry backoff in SQLite + engine.
+4. **P1 fixes** — task control API/Telegram/Android, idempotency, versioned structured memory.
+5. **P2 fixes** — Android Tasks and Memory screens bound to real endpoints; documentation refreshed.
+6. **Verification** — 205 passed / 0 failed / 26 skipped / 8 xfailed; compileall + diff check + selfcheck.
+7. **Remaining** — live integrations, isolated-worker audit, APK build and distinct PM/Android agent
+   roles remain blocked or deliberately unchanged; see `docs/IMPLEMENTATION_STATUS.md`.

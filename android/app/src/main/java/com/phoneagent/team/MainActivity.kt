@@ -84,7 +84,7 @@ class MainActivity : AppCompatActivity() {
     navRow.removeAllViews()
     val choices = listOf("Dashboard", "Projects", "Code", "Agents", "More")
     for (name in choices) {
-      val active = screen == name || (name == "More" && screen in listOf("Repository", "Changes", "Pull Requests", "Approvals", "Activity", "Telegram", "Settings"))
+      val active = screen == name || (name == "More" && screen in listOf("Repository", "Changes", "Pull Requests", "Tasks", "Memory", "Approvals", "Activity", "Telegram", "Settings"))
       val nav = TextView(this).apply {
         text = if (name == "Dashboard") "Home" else name
         contentDescription = "Navigation: $name"
@@ -98,8 +98,8 @@ class MainActivity : AppCompatActivity() {
         setOnClickListener {
           if (name != "More") navigate(name)
           else AlertDialog.Builder(this@MainActivity).setTitle("Workspace")
-            .setItems(arrayOf("Repository", "Changes", "Pull Requests", "Approvals", "Activity", "Telegram", "Settings")) { _, index ->
-              navigate(listOf("Repository", "Changes", "Pull Requests", "Approvals", "Activity", "Telegram", "Settings")[index])
+            .setItems(arrayOf("Repository", "Changes", "Pull Requests", "Tasks", "Memory", "Approvals", "Activity", "Telegram", "Settings")) { _, index ->
+              navigate(listOf("Repository", "Changes", "Pull Requests", "Tasks", "Memory", "Approvals", "Activity", "Telegram", "Settings")[index])
             }.show()
         }
       }
@@ -176,6 +176,8 @@ class MainActivity : AppCompatActivity() {
       "Changes" -> changes()
       "Pull Requests" -> pullRequests()
       "Agents" -> agents()
+      "Tasks" -> tasks()
+      "Memory" -> memory()
       "Approvals" -> approvals()
       "Activity" -> activity()
       "Telegram" -> telegram()
@@ -498,6 +500,86 @@ class MainActivity : AppCompatActivity() {
     line("Bot credentials are configured on the server, never in this app. Ask your server administrator to configure the bot and permitted Telegram user, and run the shared backend in --with-api mode.")
     button("Refresh status") { show("Telegram") }
     button("View shared activity") { navigate("Activity") }
+  }
+  private fun tasks() {
+    header("Task Manager")
+    if (!requireProject()) return
+    line("Project $projectId · task state is shared with Telegram and the backend")
+    button("Refresh tasks") { show("Tasks") }
+    bg({ api.listTasks(projectId) }) { r ->
+      val list = r.optJSONArray("tasks") ?: JSONArray()
+      if (list.length() == 0) line("No tasks have been planned for this project yet.")
+      for (i in 0 until list.length()) {
+        val t = list.getJSONObject(i)
+        val tid = t.optString("id")
+        val delayed = t.optDouble("not_before", 0.0) > System.currentTimeMillis() / 1000.0
+        val note = "id=$tid · ${t.optInt("retries")}/${t.optInt("max_retries")} retries" +
+          (if (t.optBoolean("cancel_requested")) " · cancel requested" else "") +
+          (if (delayed) " · delayed retry" else "")
+        infoCard(if (delayed) "DELAYED" else t.optString("status"),
+          "${t.optString("agent_name")}: ${t.optString("title")}", note)
+        if (t.optString("error").isNotBlank()) line(t.optString("error").take(180))
+        button("Cancel $tid") {
+          bg({ api.controlTask(projectId, tid, "cancel", "$tid-cancel-${System.currentTimeMillis()}") }) { res ->
+            toast(if (res.optBoolean("ok")) "Cancel request saved" else res.optString("error"))
+            show("Tasks")
+          }
+        }
+        button("Retry $tid") {
+          bg({ api.controlTask(projectId, tid, "retry", "$tid-retry-${System.currentTimeMillis()}") }) { res ->
+            toast(if (res.optBoolean("ok")) "Task requeued" else res.optString("error"))
+            show("Tasks")
+          }
+        }
+        button("Resume $tid") {
+          bg({ api.controlTask(projectId, tid, "resume", "$tid-resume-${System.currentTimeMillis()}") }) { res ->
+            toast(if (res.optBoolean("ok")) "Task resumed" else res.optString("error"))
+            show("Tasks")
+          }
+        }
+      }
+    }
+  }
+  private fun memory() {
+    header("Project Memory")
+    if (!requireProject()) return
+    val query = input("Search decisions, requirements and task results")
+    button("Search memory") {
+      val q = query.text.toString().trim()
+      bg({ api.listMemory(projectId, q) }) { renderMemory(it) }
+    }
+    section("Save project knowledge")
+    val kind = input("Kind (decision, requirement, note)")
+    val key = input("Key")
+    val value = input("Value")
+    button("Save to memory") {
+      val k = kind.text.toString().trim(); val name = key.text.toString().trim()
+      val v = value.text.toString().trim()
+      if (k.isBlank() || name.isBlank() || v.isBlank()) { toast("Kind, key and value are required"); return@button }
+      bg({ api.writeMemory(projectId, k, name, v) }) { res ->
+        toast(if (res.optBoolean("ok")) "Saved to project memory" else res.optString("error"))
+        show("Memory")
+      }
+    }
+    bg({ api.listMemory(projectId) }) { renderMemory(it) }
+  }
+  private fun renderMemory(r: JSONObject) {
+    section("Active structured entries")
+    val entries = r.optJSONArray("entries") ?: JSONArray()
+    if (entries.length() == 0) line("No structured entries yet. Completed tasks record real results here.")
+    for (i in 0 until entries.length()) {
+      val e = entries.getJSONObject(i)
+      infoCard("${e.optString("kind")} · v${e.optInt("version")}", e.optString("key"),
+        "${e.optString("value").take(240)}${if (e.optString("source").isNotBlank()) " · ${e.optString("source")}" else ""}")
+    }
+    section("Legacy facts (preserved)")
+    val facts = r.optJSONObject("facts") ?: JSONObject()
+    val keys = facts.keys()
+    if (!keys.hasNext()) line("No legacy facts.")
+    while (keys.hasNext()) {
+      val k = keys.next()
+      infoCard(k.take(60), facts.optString(k).take(200))
+    }
   }
   private fun approvals() {
     header("Approval Center")
