@@ -86,14 +86,16 @@ class AuthRateLimiter:
 
 
 def _http_status_from_result(result: dict, *, success_default: int = 200, error_default: int = 502) -> int:
+    # Some domain results use `status` for a state name ("CANCELLED"), not HTTP code.
+    raw = result.get("status")
+    numeric = int(raw) if isinstance(raw, int) else (
+        int(raw) if isinstance(raw, str) and raw.isdigit() else 0)
     if result.get("ok"):
-        st = int(result.get("status") or success_default)
-        return st if 200 <= st <= 299 else success_default
+        return numeric if 200 <= numeric <= 299 else success_default
     if result.get("conflict"):
         return 409
-    st = int(result.get("status") or 0)
-    if st in (400, 401, 403, 404, 405, 409, 413, 415, 422, 429, 500, 502, 503):
-        return st
+    if numeric in (400, 401, 403, 404, 405, 409, 413, 415, 422, 429, 500, 502, 503):
+        return numeric
     return error_default
 
 
@@ -190,6 +192,8 @@ def make_handler(
                 "error": t.get("error") or "",
                 "retries": t.get("retries", 0),
                 "max_retries": t.get("max_retries", 3),
+                "cancel_requested": bool(t.get("cancel_requested", 0)),
+                "not_before": t.get("not_before", 0),
                 "source": payload.get("source") or "orchestrator",
                 "instruction_preview": (payload.get("instruction") or "")[:300],
                 "depends_on": db.task_dependencies(t["id"]),
@@ -515,6 +519,9 @@ def make_handler(
                         "executions": execs,
                         "logs": logs,
                         "handoffs": handoffs,
+                        "control_events": db.list_task_control_events(tid, limit=50),
+                        "memory_history": db.memory_entry_history(pid, "task_result", tid)
+                        + db.memory_entry_history(pid, "task_failure", tid),
                     })
 
                 # GET /api/projects/{pid}/uploads
@@ -537,6 +544,21 @@ def make_handler(
                     except ValueError:
                         limit = 100
                     return self._send(200, {"ok": True, "events": db.list_sync_events(pid, limit=limit)})
+
+                # GET /api/projects/{pid}/memory — structured, versioned project knowledge
+                if len(parts) == 4 and sub == "memory":
+                    try:
+                        limit = int(self._q1(q, "limit", "100"))
+                    except ValueError:
+                        limit = 100
+                    return self._send(200, {
+                        "ok": True,
+                        "project_id": pid,
+                        "facts": db.get_memory(pid),
+                        "entries": db.search_memory_entries(
+                            pid, kind=self._q1(q, "kind"), query=self._q1(q, "q"), limit=limit,
+                            include_history=self._q1(q, "history").lower() in ("1", "true", "yes")),
+                    })
 
                 # GET /api/projects/{pid}/repository
                 if len(parts) == 4 and sub == "repository":
@@ -905,6 +927,7 @@ def make_handler(
                         res = engine.create_single_task(
                             pid, agent_id, title, instruction,
                             priority=priority, depends_on=deps, auto_run=auto_run, source="dashboard",
+                            idempotency_key=idem_key,
                         )
                         code = _http_status_from_result(res, success_default=201, error_default=400)
                         if res.get("ok") and idem_key:
@@ -922,13 +945,58 @@ def make_handler(
                     tid = db.create_task(
                         pid, agent_id, title[:200],
                         {"instruction": instruction[:8000], "source": "dashboard"},
-                        priority=priority, depends_on=deps,
+                        priority=priority, depends_on=deps, idempotency_key=idem_key,
                     )
                     db.record_sync(pid, "dashboard", "task_created", f"{tid} ({agent_id}: {title[:80]})")
                     resp = {"ok": True, "id": tid, "task_status": "QUEUED", "deduplicated": False}
                     if idem_key:
                         db.save_idempotent_response(f"task:{pid}:{idem_key}", pid, resp)
                     return self._send(201, resp)
+
+                # POST /api/projects/{pid}/tasks/{tid}/control — owner task control
+                if len(parts) == 6 and sub == "tasks" and parts[5] == "control":
+                    tid = parts[4]
+                    action = str(body.get("action") or "").strip().lower()
+                    if action not in ("cancel", "retry", "resume"):
+                        return self._send(400, {"ok": False, "error": "action must be cancel, retry or resume"})
+                    task = db.get_task(tid)
+                    if not task or task["project_id"] != pid:
+                        return self._send(404, {"ok": False, "error": "task not found in this project"})
+                    idem_key = str(body.get("idempotency_key") or "").strip()
+                    cache_key = f"task-control:{pid}:{tid}:{idem_key}"
+                    if idem_key:
+                        cached = db.get_idempotent_response(cache_key)
+                        if cached:
+                            return self._send(200, {**cached, "deduplicated": True})
+                    if engine is None:
+                        return self._send(503, {"ok": False, "error": "orchestrator engine not attached"})
+                    res = engine.control_task(
+                        pid, tid, action, actor=str(body.get("actor") or "dashboard")[:80])
+                    code = _http_status_from_result(res, success_default=200, error_default=409)
+                    if code < 400 and idem_key:
+                        db.save_idempotent_response(cache_key, pid, res)
+                    return self._send(code, res)
+
+                # POST /api/projects/{pid}/memory — add a structured project fact
+                if len(parts) == 4 and sub == "memory":
+                    kind = str(body.get("kind") or "").strip()
+                    key = str(body.get("key") or "").strip()
+                    value = str(body.get("value") or "").strip()
+                    if not kind or not key or not value:
+                        return self._send(400, {"ok": False, "error": "kind, key and value are required"})
+                    if engine is not None:
+                        res = engine.memory.remember_entry(
+                            pid, kind, key, value,
+                            source=str(body.get("source") or "dashboard")[:120],
+                            task_id=str(body.get("task_id") or "")[:80])
+                    else:
+                        res = db.remember_entry(pid, kind, key, value,
+                                                source=str(body.get("source") or "dashboard")[:120])
+                    if not res.get("ok"):
+                        return self._send(400, res)
+                    db.record_sync(pid, "dashboard", "memory_written", f"{kind}:{key[:80]}")
+                    entry = db.search_memory_entries(pid, kind=kind, limit=1)
+                    return self._send(200, {**res, "entry": entry[0] if entry else None})
 
                 # POST /api/projects/{pid}/control
                 if len(parts) == 4 and sub == "control":

@@ -35,3 +35,20 @@ In accordance with strict engineering standards, **no subsystem is claimed live-
 3. Run `RUN_LIVE_TESTS=1 python3 -m pytest tests/test_live_integrations.py -v` on the phone to live-verify your API keys and Telegram token.
 4. Disable Android battery optimization for Termux and start `./scripts/start_termux.sh --daemon`.
 5. Send `/start`, `/health`, and a small test project (`/new BookApi: Build a REST API for books`) from your authorized Telegram account, including testing an inline **✅ Approve / ❌ Reject** callback button via `/pending`.
+
+---
+
+## Update — gap remediation branch (2026-11-19)
+
+The table above describes the merged v3 platform. This branch adds the following verified rows;
+its local suite reports **205 passed, 26 skipped, 8 xfailed** (baseline 195 passed).
+
+| Subsystem | Status | Evidence |
+|---|---|---|
+| Durable per-task cancel/retry/resume with restart safety, backoff and completed-task immutability | `IMPLEMENTED AND TESTED` | `memory/database.py` (schema v6), `orchestrator/engine.py`, `tests/test_task_control_and_memory.py` |
+| Shared task control through API and Telegram, idempotent Android calls | `IMPLEMENTED AND TESTED` (backend) / `NOT VERIFIED` (built APK) | `integrations/api/server.py`, `integrations/telegram/handler.py`, `android/...` |
+| Versioned, deduplicated, project-scoped structured memory with retention | `IMPLEMENTED AND TESTED` | `memory_entries` table, `GET/POST .../memory`, 9 new tests |
+| Live AI/Telegram/GitHub workflows, isolated worker, Android build for this commit | `BLOCKED BY EXTERNAL REQUIREMENT` | no credentials, dedicated test repo, Android SDK or independent escape audit |
+
+**Overall classification for this branch: DEVELOPMENT READY — not Integration/Staging/Production Ready.**
+Local automated evidence is strong; live end-to-end evidence and a build artifact for this commit are absent.

@@ -110,6 +110,25 @@ class ApiClient(var base: String, var token: String) {
   fun controlProject(projectId: String, action: String): JSONObject =
     post("/api/projects/$projectId/control", JSONObject().put("action", action))
 
+  /** Owner task control. A key makes repeated taps/network retries safe. */
+  fun controlTask(
+    projectId: String,
+    taskId: String,
+    action: String,
+    idempotencyKey: String = "",
+  ): JSONObject {
+    val body = JSONObject().put("action", action).put("actor", "android")
+    if (idempotencyKey.isNotBlank()) body.put("idempotency_key", idempotencyKey)
+    return post("/api/projects/$projectId/tasks/$taskId/control", body)
+  }
+
+  fun listMemory(projectId: String, query: String = "", kind: String = ""): JSONObject =
+    get("/api/projects/$projectId/memory" + UrlSecurity.buildQuery(listOf("q" to query, "kind" to kind)))
+
+  fun writeMemory(projectId: String, kind: String, key: String, value: String): JSONObject =
+    post("/api/projects/$projectId/memory", JSONObject()
+      .put("kind", kind).put("key", key).put("value", value).put("source", "android"))
+
   fun listProjectLogs(projectId: String, taskId: String? = null, limit: Int = 60): JSONObject =
     get("/api/projects/$projectId/logs" + UrlSecurity.buildQuery(listOf("task_id" to taskId, "limit" to limit.toString())))
 

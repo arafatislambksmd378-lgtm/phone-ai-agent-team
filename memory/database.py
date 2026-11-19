@@ -1,5 +1,6 @@
 """SQLite persistence — WAL, migrations, atomic claim, handoffs, audit logs, crash-safe recovery."""
 from __future__ import annotations
+import hashlib
 import json
 import sqlite3
 import threading
@@ -8,7 +9,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 V4_SCHEMA = """
 CREATE TABLE IF NOT EXISTS github_connections (id TEXT PRIMARY KEY, owner TEXT NOT NULL DEFAULT '', scopes TEXT NOT NULL DEFAULT '', token_ref TEXT NOT NULL DEFAULT 'env:GITHUB_TOKEN', status TEXT NOT NULL DEFAULT 'DISCONNECTED', created_at REAL NOT NULL, updated_at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS project_repositories (project_id TEXT PRIMARY KEY REFERENCES projects(id), repo_full_name TEXT NOT NULL, owner TEXT NOT NULL, name TEXT NOT NULL, visibility TEXT NOT NULL DEFAULT 'private', default_branch TEXT NOT NULL DEFAULT '', working_branch TEXT, connected_at REAL NOT NULL);
@@ -99,6 +100,28 @@ CREATE INDEX IF NOT EXISTS idx_approval_audit ON approval_audit_logs(project_id,
 CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_unique_step ON tasks(project_id, agent_id, title);
 """
 
+# v6 is additive: durable task control + versioned, project-scoped memory.
+# No existing column or row is dropped or rewritten.
+V6_SCHEMA = """
+CREATE TABLE IF NOT EXISTS task_control_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL, task_id TEXT NOT NULL,
+    action TEXT NOT NULL, actor TEXT NOT NULL DEFAULT 'system',
+    detail TEXT NOT NULL DEFAULT '', ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_task_control_task ON task_control_events(task_id, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_task_control_project ON task_control_events(project_id, ts DESC);
+CREATE TABLE IF NOT EXISTS memory_entries (
+    id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+    kind TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL,
+    sha256 TEXT NOT NULL DEFAULT '', version INTEGER NOT NULL DEFAULT 1,
+    source TEXT NOT NULL DEFAULT '', task_id TEXT NOT NULL DEFAULT '',
+    superseded_by TEXT, created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_project_kind ON memory_entries(project_id, kind, key, version DESC);
+CREATE INDEX IF NOT EXISTS idx_memory_project_time ON memory_entries(project_id, created_at DESC);
+"""
+
 
 class Database:
     def __init__(self, path: str | Path):
@@ -118,6 +141,7 @@ class Database:
         with self._lock:
             self._conn.executescript(SCHEMA)
             self._conn.executescript(V4_SCHEMA)  # v4: additive, preserves all v3 data
+            self._conn.executescript(V6_SCHEMA)  # v6: additive, preserves all v3-v5 data
             if "description" not in {r["name"] for r in self._conn.execute("PRAGMA table_info(projects)")}:
                 self._conn.execute("ALTER TABLE projects ADD COLUMN description TEXT NOT NULL DEFAULT ''")
             proj_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(projects)").fetchall()}
@@ -129,6 +153,13 @@ class Database:
                 self._conn.execute("ALTER TABLE tasks ADD COLUMN output_data TEXT NOT NULL DEFAULT '{}'")
             if "acceptance_criteria" not in task_cols:
                 self._conn.execute("ALTER TABLE tasks ADD COLUMN acceptance_criteria TEXT NOT NULL DEFAULT '[]'")
+            # v6: durable per-task control. Existing rows default to normal scheduling.
+            if "cancel_requested" not in task_cols:
+                self._conn.execute("ALTER TABLE tasks ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
+            if "not_before" not in task_cols:
+                self._conn.execute("ALTER TABLE tasks ADD COLUMN not_before REAL NOT NULL DEFAULT 0")
+            if "idempotency_key" not in task_cols:
+                self._conn.execute("ALTER TABLE tasks ADD COLUMN idempotency_key TEXT NOT NULL DEFAULT ''")
 
             appr_cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(approvals)").fetchall()}
             if "expires_at" not in appr_cols:
@@ -219,11 +250,23 @@ class Database:
     def create_task(self, project_id: str, agent_id: str, title: str, payload: dict | None = None,
                     priority: int = 100, depends_on: list[str] | None = None,
                     max_retries: int = 3,
-                    acceptance_criteria: list[str] | None = None) -> str:
-        """Idempotent per (project, agent, title): re-planning never duplicates work."""
+                    acceptance_criteria: list[str] | None = None,
+                    idempotency_key: str = "") -> str:
+        """Idempotent per (project, agent, title) and optionally per supplied key."""
+        if idempotency_key:
+            by_key = self.query_one(
+                "SELECT id FROM tasks WHERE project_id=? AND idempotency_key=?",
+                (project_id, idempotency_key[:160]))
+            if by_key:
+                return by_key["id"]
         existing = self.query_one(
             "SELECT id FROM tasks WHERE project_id=? AND agent_id=? AND title=?", (project_id, agent_id, title))
         if existing:
+            if idempotency_key:
+                self.execute(
+                    "UPDATE tasks SET idempotency_key=?, updated_at=? WHERE id=? AND idempotency_key=''",
+                    (idempotency_key[:160], time.time(), existing["id"]))
+
             tid = existing["id"]
             for dep in (depends_on or []):
                 if dep and dep != tid:
@@ -234,10 +277,11 @@ class Database:
         now = time.time()
         self.execute(
             "INSERT INTO tasks(id,project_id,agent_id,title,status,priority,payload,"
-            "acceptance_criteria,max_retries,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "acceptance_criteria,max_retries,idempotency_key,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (tid, project_id, agent_id, title, "QUEUED", priority,
              json.dumps(payload or {}), json.dumps(acceptance_criteria or []),
-             max_retries, now, now))
+             max_retries, idempotency_key[:160], now, now))
         for dep in (depends_on or []):
             if dep and dep != tid:
                 self.execute("INSERT OR IGNORE INTO task_dependencies(task_id,depends_on) VALUES(?,?)",
@@ -272,18 +316,26 @@ class Database:
                     (now, cutoff))
                 self._conn.execute(
                     "UPDATE tasks SET status='QUEUED', locked_by=NULL, locked_at=NULL, updated_at=? "
-                    "WHERE status='EXECUTING' AND locked_at IS NOT NULL AND locked_at < ?",
+                    "WHERE status='EXECUTING' AND locked_at IS NOT NULL AND locked_at < ? "
+                    "AND COALESCE(cancel_requested,0)=0",
                     (now, cutoff))
+                self._conn.execute(
+                    "UPDATE tasks SET status='CANCELLED', error='Cancelled by owner', "
+                    "locked_by=NULL, locked_at=NULL, not_before=0, updated_at=? "
+                    "WHERE status='EXECUTING' AND locked_at IS NOT NULL AND locked_at < ? "
+                    "AND COALESCE(cancel_requested,0)=1", (now, cutoff))
             row = self._conn.execute("""
                 SELECT t.* FROM tasks t
                 JOIN projects pr ON pr.id = t.project_id
                 WHERE t.status='QUEUED'
+                  AND COALESCE(t.cancel_requested, 0)=0
+                  AND COALESCE(t.not_before, 0)<=?
                   AND pr.lifecycle NOT IN ('PAUSED', 'CANCELLED', 'WAITING_FOR_APPROVAL')
                   AND NOT EXISTS (
                     SELECT 1 FROM task_dependencies d JOIN tasks p ON p.id=d.depends_on
                     WHERE d.task_id=t.id AND p.status NOT IN ('COMPLETED','SKIPPED')
                 ) ORDER BY t.priority ASC, t.created_at ASC LIMIT 1
-            """).fetchone()
+            """, (now,)).fetchone()
             if not row:
                 self._conn.commit()
                 return None
@@ -301,10 +353,12 @@ class Database:
                         error: str | None = None, output_data: dict | None = None) -> None:
         out_json = json.dumps(output_data) if output_data is not None else None
         if status in ("COMPLETED", "FAILED", "CANCELLED", "SKIPPED"):
+            # A completed task must never become runnable again on a later claim.
+            clear_flags = "not_before=0, " + ("cancel_requested=0, " if status == "COMPLETED" else "")
             self.execute(
                 "UPDATE tasks SET status=?, result=COALESCE(?,result), "
                 "output_data=COALESCE(?,output_data), error=COALESCE(?,error), "
-                "locked_by=NULL, locked_at=NULL, updated_at=? WHERE id=?",
+                f"{clear_flags}locked_by=NULL, locked_at=NULL, updated_at=? WHERE id=?",
                 (status, result, out_json, error, time.time(), tid))
         else:
             self.execute(
@@ -312,6 +366,90 @@ class Database:
                 "output_data=COALESCE(?,output_data), error=COALESCE(?,error), "
                 "updated_at=? WHERE id=?",
                 (status, result, out_json, error, time.time(), tid))
+
+    # ---- durable per-task control (cancel / retry / resume) ----
+    FINAL_TASK_STATES = ("COMPLETED", "FAILED", "CANCELLED", "SKIPPED")
+
+    def record_task_control_event(self, task_id: str, action: str, project_id: str = "",
+                                  actor: str = "system", detail: str = "") -> None:
+        self.execute(
+            "INSERT INTO task_control_events(project_id,task_id,action,actor,detail,ts) "
+            "VALUES(?,?,?,?,?,?)",
+            (project_id, task_id, action[:40], actor[:80], detail[:500], time.time()))
+
+    def list_task_control_events(self, task_id: str, limit: int = 50) -> list[dict]:
+        return self.query(
+            "SELECT * FROM task_control_events WHERE task_id=? ORDER BY ts DESC, id DESC LIMIT ?",
+            (task_id, max(1, min(int(limit), 200))))
+
+    def is_task_cancel_requested(self, tid: str) -> bool:
+        row = self.query_one("SELECT cancel_requested FROM tasks WHERE id=?", (tid,))
+        return bool(row and row["cancel_requested"])
+
+    def request_task_cancel(self, tid: str, actor: str = "system") -> dict:
+        """Persist a cancel request. Running workers observe it and stop before publishing results."""
+        with self._lock:
+            row = self._conn.execute("SELECT id,status,project_id FROM tasks WHERE id=?", (tid,)).fetchone()
+            if not row:
+                return {"ok": False, "error": "Task not found"}
+            status, pid = row["status"], row["project_id"]
+            if status in self.FINAL_TASK_STATES:
+                self.record_task_control_event(tid, "cancel_noop", pid, actor, f"already {status}")
+                return {"ok": True, "status": status, "effective": "none", "deduplicated": True}
+            now = time.time()
+            if status == "EXECUTING":
+                # Keep EXECUTING until the worker acknowledges; checkpoint/recovery also
+                # respects the persisted flag, so a restart cannot resurrect this task.
+                self._conn.execute(
+                    "UPDATE tasks SET cancel_requested=1, updated_at=? WHERE id=?", (now, tid))
+                effective = "pending"
+            else:
+                self._conn.execute(
+                    "UPDATE tasks SET cancel_requested=1, status='CANCELLED', error=?, "
+                    "locked_by=NULL, locked_at=NULL, not_before=0, updated_at=? WHERE id=?",
+                    (f"Cancelled by {actor[:80]}", now, tid))
+                effective = "cancelled"
+            self._conn.commit()
+        self.record_task_control_event(tid, "cancel_requested", pid, actor, effective)
+        return {"ok": True, "status": "EXECUTING" if effective == "pending" else "CANCELLED",
+                "effective": effective, "deduplicated": False}
+
+    def requeue_task(self, tid: str, action: str, actor: str = "system") -> dict:
+        """Explicitly retry/resume ONE task. Completed tasks are never re-run (no duplicate PRs)."""
+        if action not in ("retry", "resume"):
+            return {"ok": False, "error": f"Unsupported task action: {action}"}
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id,status,project_id,retries FROM tasks WHERE id=?", (tid,)).fetchone()
+            if not row:
+                return {"ok": False, "error": "Task not found"}
+            status, pid = row["status"], row["project_id"]
+            allowed = ("FAILED", "CANCELLED", "SKIPPED") if action == "retry" else ("CANCELLED", "SKIPPED")
+            if status not in allowed:
+                reason = ("Completed tasks cannot be re-run; create a new task"
+                          if status == "COMPLETED" else f"Cannot {action} a task in {status}")
+                self.record_task_control_event(tid, f"{action}_rejected", pid, actor, reason)
+                return {"ok": False, "error": reason, "status": status}
+            now = time.time()
+            # A manual retry grants a fresh attempt budget; every attempt remains audited.
+            resets = "retries=0" if action == "retry" else "retries=retries"
+            self._conn.execute(
+                f"UPDATE tasks SET status='QUEUED', cancel_requested=0, not_before=0, error=NULL, "
+                f"locked_by=NULL, locked_at=NULL, {resets}, updated_at=? WHERE id=?", (now, tid))
+            self._conn.commit()
+        self.record_task_control_event(tid, action, pid, actor, f"from {status}")
+        return {"ok": True, "status": "QUEUED", "previous_status": status, "deduplicated": False}
+
+    def requeue_with_backoff(self, tid: str, delay_seconds: float, error: str) -> bool:
+        """Schedule an automatic retry no earlier than now+delay (atomic with claim)."""
+        delay = max(0.0, min(float(delay_seconds), 3600.0))
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE tasks SET status='QUEUED', not_before=?, error=?, cancel_requested=0, "
+                "locked_by=NULL, locked_at=NULL, updated_at=? WHERE id=? AND status='EXECUTING'",
+                (time.time() + delay, error[:2000], time.time(), tid))
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def propagate_dependency_failures(self, project_id: str) -> int:
         """Mark QUEUED tasks as SKIPPED when any upstream dependency has permanently FAILED."""
@@ -360,7 +498,7 @@ class Database:
         now = time.time()
         with self._lock:
             cur = self._conn.execute(
-                "UPDATE tasks SET status='QUEUED', error=NULL, updated_at=? "
+                "UPDATE tasks SET status='QUEUED', error=NULL, not_before=0, cancel_requested=0, updated_at=? "
                 "WHERE project_id=? AND status='FAILED' AND retries < max_retries",
                 (now, project_id))
             requeued = cur.rowcount
@@ -386,8 +524,10 @@ class Database:
                 "WHERE status='RUNNING' AND task_id IN (SELECT id FROM tasks WHERE status='EXECUTING')",
                 (now,))
             cur = self._conn.execute(
-                "UPDATE tasks SET status='QUEUED', locked_by=NULL, locked_at=NULL, updated_at=? "
-                "WHERE status='EXECUTING'", (now,))
+                "UPDATE tasks SET status=CASE WHEN COALESCE(cancel_requested,0)=1 "
+                "THEN 'CANCELLED' ELSE 'QUEUED' END, "
+                "not_before=CASE WHEN COALESCE(cancel_requested,0)=1 THEN 0 ELSE not_before END, "
+                "locked_by=NULL, locked_at=NULL, updated_at=? WHERE status='EXECUTING'", (now,))
             self._conn.commit()
             return cur.rowcount
 
@@ -573,6 +713,70 @@ class Database:
     def get_memory(self, project_id: str) -> dict:
         row = self.query_one("SELECT facts FROM project_memory WHERE project_id=?", (project_id,))
         return json.loads(row["facts"]) if row else {}
+
+    # ---- versioned, project-scoped structured memory ----
+    def remember_entry(self, project_id: str, kind: str, key: str, value: str,
+                       source: str = "", task_id: str = "", max_versions: int = 25) -> dict:
+        """Store or deduplicate one structured memory fact, preserving prior versions.
+
+        Entries are isolated by project_id. Identical content for the same (kind,key)
+        never creates a new version; changed content supersedes the active entry and
+        older versions are pruned beyond ``max_versions`` (retention rule).
+        """
+        kind, key, value = str(kind)[:64], str(key)[:200], str(value)[:20_000]
+        if not kind or not key:
+            return {"ok": False, "error": "kind and key are required"}
+        digest = hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+        with self._lock:
+            active = self._conn.execute(
+                "SELECT id,version,sha256 FROM memory_entries WHERE project_id=? AND kind=? "
+                "AND key=? AND superseded_by IS NULL ORDER BY version DESC LIMIT 1",
+                (project_id, kind, key)).fetchone()
+            if active and active["sha256"] == digest:
+                return {"ok": True, "id": active["id"], "version": active["version"],
+                        "deduped": True}
+            now = time.time()
+            mid = f"mem_{uuid.uuid4().hex[:16]}"
+            version = int(active["version"]) + 1 if active else 1
+            self._conn.execute(
+                "INSERT INTO memory_entries(id,project_id,kind,key,value,sha256,version,source,task_id,"
+                "superseded_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,NULL,?)",
+                (mid, project_id, kind, key, value, digest, version, source[:120], task_id[:80], now))
+            if active:
+                self._conn.execute("UPDATE memory_entries SET superseded_by=? WHERE id=?",
+                                   (mid, active["id"]))
+            # Retention: keep the newest N versions of this key; active is always newest.
+            keep = max(2, min(int(max_versions), 200))
+            old = self._conn.execute(
+                "SELECT id FROM memory_entries WHERE project_id=? AND kind=? AND key=? "
+                "ORDER BY version DESC LIMIT -1 OFFSET ?", (project_id, kind, key, keep)).fetchall()
+            for r in old:
+                self._conn.execute("DELETE FROM memory_entries WHERE id=?", (r["id"],))
+            self._conn.commit()
+        return {"ok": True, "id": mid, "version": version, "deduped": False}
+
+    def search_memory_entries(self, project_id: str, kind: str = "", query: str = "",
+                              limit: int = 100, include_history: bool = False) -> list[dict]:
+        sql = ("SELECT id,project_id,kind,key,value,version,source,task_id,superseded_by,created_at "
+               "FROM memory_entries WHERE project_id=?")
+        params: list[object] = [project_id]
+        if not include_history:
+            sql += " AND superseded_by IS NULL"
+        if kind:
+            sql += " AND kind=?"
+            params.append(kind[:64])
+        if query:
+            sql += " AND (instr(lower(key), lower(?)) > 0 OR instr(lower(value), lower(?)) > 0)"
+            params.extend([query[:200], query[:200]])
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 200)))
+        return self.query(sql, tuple(params))
+
+    def memory_entry_history(self, project_id: str, kind: str, key: str) -> list[dict]:
+        return self.query(
+            "SELECT id,version,value,source,task_id,superseded_by,created_at FROM memory_entries "
+            "WHERE project_id=? AND kind=? AND key=? ORDER BY version DESC LIMIT 200",
+            (project_id, kind[:64], key[:200]))
 
     def record_checkpoint(self, project_id: str, label: str, snapshot_path: str) -> str:
         cid = f"chk_{uuid.uuid4().hex[:12]}"

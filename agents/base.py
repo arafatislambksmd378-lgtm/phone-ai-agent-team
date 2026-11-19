@@ -245,6 +245,7 @@ class BaseAgent:
                     user=prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
+                    project_id=self.project_id,
                 )
             except TypeError:
                 # Backward-compatible call for minimal test stubs with 3-arg complete()

@@ -29,3 +29,18 @@ This document maps every requirement from the Master Execution Specification to 
 | **REQ-12** | Category-aware real `pytest` execution & Debugging Agent 7-step diagnosis/repair/regression loop | `agents/qa_tester/agent.py`, `agents/debugger/agent.py` | `tests/test_handoffs_and_workflows.py::test_ai_powered_custom_code_generation_and_debugger_repair_loop` | `PARTIALLY IMPLEMENTED` | `IMPLEMENTED AND TESTED` |
 | **REQ-13** | Complete Telegram Bot commands, blueprint staging, `callback_query` inline buttons, progress/error alerts, final report & `sendDocument` ZIP delivery | `integrations/telegram/{bot,handler}.py`, `main.py` | `tests/test_telegram.py`, `tests/test_approvals_and_telegram_e2e.py` | `PARTIALLY IMPLEMENTED` | `IMPLEMENTED AND TESTED` (Live Telegram Bot API: `IMPLEMENTED BUT NOT LIVE-VERIFIED`) |
 | **REQ-14** | Safe repeatable Termux install/start/stop/healthcheck scripts, `.env.example`, and complete documentation suite | `scripts/*.sh`, `.env.example`, `README.md`, `docs/*.md` | `tests/test_document_and_github.py::test_required_scripts_and_documentation_exist` | `PARTIALLY IMPLEMENTED` | `IMPLEMENTED AND TESTED` |
+
+---
+
+## Addendum — master-prompt gap remediation (2026-11-19)
+
+These rows document the work on `arena/3d5b512c-phone-ai-agent-team`. They supplement, not replace,
+the earlier requirement table. Verified locally: **205 passed, 26 skipped, 8 xfailed**.
+
+| Req ID | Requirement | Primary Modules | Executed Verification | Status |
+|---|---|---|---|---|
+| **REQ-15** | Persistent task cancellation, retry, resume, duplicate prevention and failure backoff | `memory/database.py` (v6), `orchestrator/engine.py`, `config/settings.py` | `tests/test_task_control_and_memory.py::test_v6_migration_preserves_legacy_data_and_adds_columns`, `::test_cancel_queued_task_is_durable_and_never_claimed`, `::test_cancel_running_task_survives_crash_recovery`, `::test_retry_backoff_is_enforced_by_atomic_claim`, `::test_retry_and_resume_rules_prevent_duplicate_completed_work` | `IMPLEMENTED AND TESTED` |
+| **REQ-16** | Task Manager control available through Android + Telegram + shared API with idempotency and audit trail | `integrations/api/server.py`, `integrations/telegram/handler.py`, `android/.../ApiClient.kt`, `MainActivity.kt` | `::test_engine_control_task_writes_shared_sync_events`, `::test_telegram_task_command_controls_one_task`, `::test_api_control_and_memory_endpoints_are_auth_gated_and_idempotent` | `IMPLEMENTED AND TESTED` on backend (Android build: `NOT VERIFIED` locally — no SDK) |
+| **REQ-17** | Structured, searchable, versioned, isolated project memory with retention and real task outcomes | `memory/project_memory.py`, `memory/database.py` (`memory_entries`), `orchestrator/engine.py` | `::test_structured_memory_is_deduped_versioned_isolated_and_bounded`, API memory test | `IMPLEMENTED AND TESTED` |
+| **REQ-18** | Original 16-role alignment (Project Manager, Android Developer) | `agents/registry.py`, `orchestrator/planner.py` | Source inspection in `docs/REPOSITORY_GAP_ANALYSIS.md` | `PARTIALLY IMPLEMENTED` — responsibilities covered by orchestrator/planner and architect/devops; distinct roles intentionally not renamed to preserve history |
+| **REQ-19** | Live AI/Telegram/GitHub end-to-end workflow and APK evidence for this commit | external credentials, dedicated test repo, Android SDK | `tests/test_live_integrations.py` (4 skipped), worker tests (22 skipped) | `BLOCKED BY EXTERNAL REQUIREMENT` — reported honestly, not simulated |

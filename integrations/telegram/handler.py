@@ -15,6 +15,7 @@ HELP = """*Phone AI Agent Team* — commands
 /build [id] — start or replan dynamic pipeline for active project
 /status [id] — project lifecycle, category & task statuses
 /tasks [id] — list all tasks (from Telegram & Android dashboard)
+/task <task_id> [cancel|retry|resume] — control one task (shared with Android)
 /sync [id] — recent dashboard ↔ Telegram synchronization events
 /agents — list all 16 specialist agents & current state
 /pause /resume — pause or resume the worker pool
@@ -98,13 +99,13 @@ class TelegramHandler:
                 self.engine.approvals.record_unauthorized(aid, actor=str(uid or "unknown"), detail=data)
                 if cb.get("id"):
                     bot.answer_callback_query(cb["id"], "⛔ Not authorized.", show_alert=True)
-                log.warning("rejected unauthorized callback_query from user %s", uid)
+                log.warning("rejected unauthorized callback_query (identity withheld)")
                 return
             msg = update.get("message") or update.get("edited_message") or {}
             chat = (msg.get("chat") or {}).get("id")
             if chat:
                 bot.send_message(chat, "⛔ Not authorized.")
-                log.warning("rejected unauthorized update from user %s", uid)
+                log.warning("rejected unauthorized update (identity withheld)")
             return
 
         if "callback_query" in update:
@@ -194,6 +195,7 @@ class TelegramHandler:
             "/start": self._cmd_start, "/help": self._cmd_help,
             "/new": self._cmd_new, "/build": self._cmd_build,
             "/status": self._cmd_status, "/tasks": self._cmd_tasks,
+            "/task": self._cmd_task,
             "/sync": self._cmd_sync, "/agents": self._cmd_agents,
             "/pause": self._cmd_pause, "/resume": self._cmd_resume,
             "/stop": self._cmd_stop, "/cancel": self._cmd_stop,
@@ -316,6 +318,30 @@ class TelegramHandler:
                 src = "orchestrator"
             lines.append(f"• `{t['id']}` [{t['status']}] `{t['agent_id']}` — {t['title']} _({src})_")
         bot.send_message(chat_id, "\n".join(lines))
+
+    def _cmd_task(self, bot, chat_id, arg):
+        parts = (arg or "").split()
+        if not parts:
+            return bot.send_message(chat_id, "Usage: /task <task_id> [cancel|retry|resume]")
+        tid = parts[0]
+        task = self.engine.db.get_task(tid)
+        if not task:
+            return bot.send_message(chat_id, f"Unknown task: {tid}")
+        if len(parts) == 1:
+            return bot.send_message(
+                chat_id,
+                f"`{tid}` [{task['status']}] `{task['agent_id']}` — {task['title']}\n"
+                f"retries={task.get('retries', 0)}/{task.get('max_retries', 3)} "
+                f"cancel_requested={bool(task.get('cancel_requested', 0))}",
+            )
+        action = parts[1].lower()
+        res = self.engine.control_task(task["project_id"], tid, action, actor="telegram")
+        if not res.get("ok"):
+            return bot.send_message(chat_id, f"⚠️ {res.get('error', 'control failed')}")
+        bot.send_message(
+            chat_id,
+            f"🎛 `{tid}` {action}: {res.get('status')}. Android sees the same task state.",
+        )
 
     def _cmd_sync(self, bot, chat_id, arg):
         pid = (arg or "").split()[0] if arg else ""

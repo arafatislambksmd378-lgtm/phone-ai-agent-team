@@ -13,6 +13,7 @@ venv/
 
 # Runtime state
 data/
+live-evidence/
 logs/*.log*
 projects/
 backups/*
