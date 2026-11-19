@@ -10,6 +10,7 @@ import json
 import os
 import sys
 import time
+import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -58,6 +59,18 @@ def main() -> int:
     ws = OUT / "workspace"
     ws.mkdir(parents=True, exist_ok=True)
     db = Database(db_path)
+
+    def discover_models() -> str:
+        """Read-only model catalog query (no generation, no charge). Prints names only."""
+        req = urllib.request.Request(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            headers={"x-goog-api-key": os.getenv("GEMINI_API_KEY", "")})
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            data = json.load(resp)
+        names = [str(m.get("name", "")) for m in data.get("models", [])
+                 if "flash" in str(m.get("name", "")).lower()]
+        assert names, "no flash models returned by catalog"
+        return f"available_flash_models={names[:25]}"
 
     def health_check() -> str:
         router = ModelRouter(settings_for(db_path, ws), db=db)
@@ -160,6 +173,7 @@ def main() -> int:
         finally:
             engine.shutdown()
 
+    step("Gemini model catalog (read-only, no charge)", discover_models)
     step("provider health reports LIVE", health_check)
     step("real Gemini completion returns live model output", live_completion)
     step("invalid key is rejected by real provider", invalid_key)
