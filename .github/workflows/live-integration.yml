@@ -34,6 +34,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: write   # only to post redacted failure evidence on PR #6
 
 jobs:
   live-verification:
@@ -73,11 +74,17 @@ jobs:
           python -m pytest tests/ -q -o addopts='' 2>&1 | tee live-evidence/local-tests.log
 
       - name: Real Gemini provider + real agent execution
-        run: python scripts/live_provider_check.py
+        run: |
+          set -o pipefail
+          mkdir -p live-evidence
+          python scripts/live_provider_check.py 2>&1 | tee live-evidence/provider-run.log
 
       - name: Real Telegram Bot + Android synchronization
         if: ${{ inputs.run_telegram || github.event_name == 'push' }}
-        run: python scripts/live_telegram_check.py
+        run: |
+          set -o pipefail
+          mkdir -p live-evidence
+          python scripts/live_telegram_check.py 2>&1 | tee live-evidence/telegram-run.log
 
       - name: Opt-in live pytest subset
         run: |
@@ -107,3 +114,20 @@ jobs:
           name: live-integration-evidence
           path: live-evidence/
           if-no-files-found: warn
+
+      - name: Post redacted failure evidence to PR #6
+        if: failure() && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## Live integration failure evidence"
+            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Head: ${GITHUB_SHA}"
+            for f in live-evidence/*.log live-evidence/*.md; do
+              [ -f "$f" ] || continue
+              echo "===== $f ====="
+              tail -n 120 "$f"
+            done
+          } > /tmp/failure-evidence.md
+          gh pr comment 6 --body-file /tmp/failure-evidence.md
