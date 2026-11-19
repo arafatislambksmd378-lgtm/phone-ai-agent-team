@@ -1,0 +1,91 @@
+name: Live Integration Verification (owner-authorized, manual)
+
+# Manual only. Never runs on push/PR. Secrets are supplied by the owner through
+# GitHub Settings -> Secrets and variables -> Actions. No credential is stored in Git.
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'Provider to verify (only Gemini is enabled in this no-paid batch)'
+        type: choice
+        default: gemini
+        options:
+          - gemini
+      free_tier_confirmed:
+        description: 'I confirm this Gemini key/model incurs NO CHARGE for these checks'
+        type: boolean
+        default: false
+      run_telegram:
+        description: 'Run real Telegram Bot API checks (sends a few messages to your chat)'
+        type: boolean
+        default: true
+      run_agent_build:
+        description: 'Also run /build with live AI (slower, more calls; still requires no-charge confirmation)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  live-verification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONUNBUFFERED: '1'
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_ALLOWED_USER_ID: ${{ secrets.TELEGRAM_ALLOWED_USER_ID }}
+      RUN_LIVE_TESTS: '1'
+      FREE_TIER_CONFIRMED: ${{ inputs.free_tier_confirmed }}
+      RUN_TELEGRAM: ${{ inputs.run_telegram }}
+      RUN_AGENT_BUILD: ${{ inputs.run_agent_build }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install test dependency
+        run: python -m pip install --quiet 'pytest>=8,<10'
+
+      - name: Fail-closed credential preflight
+        run: python scripts/live_preflight.py
+
+      - name: Local automated tests (baseline, no live calls)
+        run: python -m pytest tests/ -q -o addopts=''
+
+      - name: Real Gemini provider + real agent execution
+        run: python scripts/live_provider_check.py
+
+      - name: Real Telegram Bot + Android synchronization
+        if: ${{ inputs.run_telegram }}
+        run: python scripts/live_telegram_check.py
+
+      - name: Opt-in live pytest subset
+        run: |
+          if [ "${{ inputs.run_telegram }}" = "true" ]; then
+            python -m pytest tests/test_live_integrations.py -q -o addopts='' -k 'gemini or telegram'
+          else
+            python -m pytest tests/test_live_integrations.py -q -o addopts='' -k 'gemini'
+          fi
+
+      - name: Publish redacted evidence
+        if: always()
+        run: |
+          if [ -d live-evidence ]; then
+            for f in live-evidence/*.md; do
+              [ -f "$f" ] || continue
+              echo "===== $f =====" >> "$GITHUB_STEP_SUMMARY"
+              cat "$f" >> "$GITHUB_STEP_SUMMARY"
+            done
+          fi
+
+      - name: Upload redacted evidence artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-integration-evidence
+          path: live-evidence/
+          if-no-files-found: warn

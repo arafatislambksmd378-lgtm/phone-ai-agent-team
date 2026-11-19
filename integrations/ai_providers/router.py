@@ -112,7 +112,8 @@ class ModelRouter:
 
     # ---- main entry ----
     def complete(self, agent_id: str, system: str, user: str, *,
-                 max_tokens: int | None = None, temperature: float = 0.2) -> dict:
+                 max_tokens: int | None = None, temperature: float = 0.2,
+                 project_id: str = "") -> dict:
         order = self._providers_to_try()
         if not order:
             return {"ok": True, "text": "", "provider": "mock", "model": "none",
@@ -126,7 +127,10 @@ class ModelRouter:
             result = self._call_adapter(adapter, system, user, max_tokens=max_tokens,
                                         temperature=temperature)
             if result.get("ok"):
-                self._record(provider, result, agent_id)
+                self._record(provider, result, agent_id, project_id)
+                # The router is authoritative about which registered provider answered;
+                # an adapter may hardcode its family name (e.g. two Gemini endpoints).
+                result["provider"] = provider
                 result["mode"] = "live"
                 result["mock"] = False
                 result["attempts"] = attempts
@@ -158,7 +162,7 @@ class ModelRouter:
         except TypeError:
             return adapter.complete(system, user)
 
-    def _record(self, provider: str, result: dict, agent_id: str) -> None:
+    def _record(self, provider: str, result: dict, agent_id: str, project_id: str = "") -> None:
         if self.db is None:
             return
         pt = int(result.get("prompt_tokens", 0) or 0)
@@ -166,6 +170,7 @@ class ModelRouter:
         rate = self._cost_rates.get(provider, (0.0, 0.0))
         cost = (pt * rate[0] + ct * rate[1]) / 1_000_000
         try:
-            self.db.record_usage(provider, result.get("model", ""), agent_id, pt, ct, cost)
+            self.db.record_usage(provider, result.get("model", ""), agent_id, pt, ct, cost,
+                                 project_id or None)
         except Exception:
             log.debug("usage recording failed", exc_info=True)
