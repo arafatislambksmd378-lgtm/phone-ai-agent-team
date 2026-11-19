@@ -83,14 +83,14 @@ jobs:
           python scripts/live_provider_check.py 2>&1 | tee live-evidence/provider-run.log
 
       - name: Real Telegram Bot + Android synchronization
-        if: ${{ always() && steps.preflight.result == 'success' && (inputs.run_telegram || github.event_name == 'push') }}
+        if: ${{ always() && (inputs.run_telegram || github.event_name == 'push') }}
         run: |
           set -o pipefail
           mkdir -p live-evidence
           python scripts/live_telegram_check.py 2>&1 | tee live-evidence/telegram-run.log
 
       - name: Opt-in live pytest subset
-        if: ${{ always() && steps.preflight.result == 'success' }}
+        if: always()
         run: |
           set -o pipefail
           if [ "$RUN_TELEGRAM" = "true" ]; then
