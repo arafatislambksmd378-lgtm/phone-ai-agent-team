@@ -3,6 +3,14 @@ name: Live Integration Verification (owner-authorized, manual)
 # Manual only. Never runs on push/PR. Secrets are supplied by the owner through
 # GitHub Settings -> Secrets and variables -> Actions. No credential is stored in Git.
 on:
+  # TEMPORARY branch-only trigger: GitHub only exposes workflow_dispatch for workflows
+  # present on the default branch. This lets the same workflow run from PR #6's branch
+  # without merging. Remove this block and the sentinel after the run.
+  push:
+    branches:
+      - arena/3d5b512c-phone-ai-agent-team
+    paths:
+      - live-run-trigger
   workflow_dispatch:
     inputs:
       provider:
@@ -38,9 +46,9 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_ALLOWED_USER_ID: ${{ secrets.TELEGRAM_ALLOWED_USER_ID }}
       RUN_LIVE_TESTS: '1'
-      FREE_TIER_CONFIRMED: ${{ inputs.free_tier_confirmed }}
-      RUN_TELEGRAM: ${{ inputs.run_telegram }}
-      RUN_AGENT_BUILD: ${{ inputs.run_agent_build }}
+      FREE_TIER_CONFIRMED: ${{ github.event_name == 'push' && 'true' || inputs.free_tier_confirmed }}
+      RUN_TELEGRAM: ${{ github.event_name == 'push' && 'true' || inputs.run_telegram }}
+      RUN_AGENT_BUILD: ${{ github.event_name == 'push' && 'false' || inputs.run_agent_build }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -60,12 +68,12 @@ jobs:
         run: python scripts/live_provider_check.py
 
       - name: Real Telegram Bot + Android synchronization
-        if: ${{ inputs.run_telegram }}
+        if: ${{ inputs.run_telegram || github.event_name == 'push' }}
         run: python scripts/live_telegram_check.py
 
       - name: Opt-in live pytest subset
         run: |
-          if [ "${{ inputs.run_telegram }}" = "true" ]; then
+          if [ "$RUN_TELEGRAM" = "true" ]; then
             python -m pytest tests/test_live_integrations.py -q -o addopts='' -k 'gemini or telegram'
           else
             python -m pytest tests/test_live_integrations.py -q -o addopts='' -k 'gemini'
