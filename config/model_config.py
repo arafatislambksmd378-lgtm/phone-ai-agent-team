@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-DEFAULT_MODELS: dict[str, str] = {k: "gemini-2.0-flash" for k in (
+DEFAULT_MODELS: dict[str, str] = {k: "gemini-2.5-flash" for k in (
     "chief_orchestrator", "requirement_analyst", "software_architect", "uiux_designer",
     "frontend_developer", "backend_developer", "database_engineer", "api_integrator",
     "security_engineer", "qa_tester", "debugger", "code_reviewer", "devops",
@@ -32,11 +32,11 @@ def _env_overrides() -> dict[str, str]:
 @dataclass
 class ModelConfig:
     provider_order: list[str] = field(default_factory=lambda: ["gemini", "openai", "anthropic"])
-    default_model: str = "gemini-2.0-flash"
+    default_model: str = "gemini-2.5-flash"
     # Capability flags are advisory only: they never hard-block the only configured provider.
     agent_models: dict[str, str] = field(default_factory=lambda: {**DEFAULT_MODELS, **_env_overrides()})
     provider_models: dict[str, str] = field(default_factory=lambda: {
-        "gemini": os.getenv("AI_MODEL_GEMINI", os.getenv("AI_MODEL_DEFAULT", "gemini-2.0-flash")),
+        "gemini": os.getenv("AI_MODEL_GEMINI", os.getenv("AI_MODEL_DEFAULT", "gemini-2.5-flash")),
         "openai": os.getenv("AI_MODEL_OPENAI", "gpt-4o-mini"),
         "codex": os.getenv("AI_MODEL_CODEX", "gpt-4o"),
         "anthropic": os.getenv("AI_MODEL_ANTHROPIC", "claude-3-5-haiku-latest"),

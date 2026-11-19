@@ -63,8 +63,8 @@ class Settings:
         p.strip() for p in _str("AI_PROVIDER_ORDER", "gemini,openai,anthropic").split(",") if p.strip()
     ])
     # Per-provider model names (configurable — never hardcoded in adapters).
-    ai_model_default: str = field(default_factory=lambda: _str("AI_MODEL_DEFAULT", "gemini-2.0-flash"))
-    ai_model_gemini: str = field(default_factory=lambda: _str("AI_MODEL_GEMINI", _str("AI_MODEL_DEFAULT", "gemini-2.0-flash")))
+    ai_model_default: str = field(default_factory=lambda: _str("AI_MODEL_DEFAULT", "gemini-2.5-flash"))
+    ai_model_gemini: str = field(default_factory=lambda: _str("AI_MODEL_GEMINI", _str("AI_MODEL_DEFAULT", "gemini-2.5-flash")))
     ai_model_openai: str = field(default_factory=lambda: _str("AI_MODEL_OPENAI", "gpt-4o-mini"))
     ai_model_codex: str = field(default_factory=lambda: _str("AI_MODEL_CODEX", "gpt-4o"))
     ai_model_anthropic: str = field(default_factory=lambda: _str("AI_MODEL_ANTHROPIC", "claude-3-5-haiku-latest"))

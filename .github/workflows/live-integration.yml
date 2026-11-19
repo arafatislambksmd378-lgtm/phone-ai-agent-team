@@ -43,7 +43,9 @@ jobs:
     env:
       PYTHONUNBUFFERED: '1'
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GEMINI_MODEL: ${{ vars.GEMINI_MODEL }}
+      # Owner-confirmed no-charge replacement for the retired gemini-2.0-flash.
+      # A repository variable still wins if the owner sets one.
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_ALLOWED_USER_ID: ${{ secrets.TELEGRAM_ALLOWED_USER_ID }}
       RUN_LIVE_TESTS: '1'
@@ -60,6 +62,7 @@ jobs:
         run: python -m pip install --quiet 'pytest>=8,<10'
 
       - name: Fail-closed credential preflight
+        id: preflight
         run: python scripts/live_preflight.py
 
       - name: Local automated tests (baseline, no live calls)
@@ -80,13 +83,14 @@ jobs:
           python scripts/live_provider_check.py 2>&1 | tee live-evidence/provider-run.log
 
       - name: Real Telegram Bot + Android synchronization
-        if: ${{ inputs.run_telegram || github.event_name == 'push' }}
+        if: ${{ always() && steps.preflight.result == 'success' && (inputs.run_telegram || github.event_name == 'push') }}
         run: |
           set -o pipefail
           mkdir -p live-evidence
           python scripts/live_telegram_check.py 2>&1 | tee live-evidence/telegram-run.log
 
       - name: Opt-in live pytest subset
+        if: ${{ always() && steps.preflight.result == 'success' }}
         run: |
           set -o pipefail
           if [ "$RUN_TELEGRAM" = "true" ]; then

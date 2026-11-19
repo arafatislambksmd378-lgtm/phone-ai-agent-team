@@ -60,7 +60,7 @@ class SetupPortalController:
             telegram_bot_token=vals.get("TELEGRAM_BOT_TOKEN", ""),
             telegram_allowed_user_id=uid,
             gemini_api_key=vals.get("GEMINI_API_KEY", ""),
-            ai_model_gemini=vals.get("AI_MODEL_GEMINI") or "gemini-2.0-flash",
+            ai_model_gemini=vals.get("AI_MODEL_GEMINI") or "gemini-2.5-flash",
             openai_api_key=vals.get("OPENAI_API_KEY", ""),
             openai_base_url=vals.get("OPENAI_BASE_URL") or "https://api.openai.com/v1",
             ai_model_openai=vals.get("AI_MODEL_OPENAI") or "gpt-4o-mini",

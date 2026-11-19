@@ -18,8 +18,8 @@ All runtime settings are loaded from environment variables or `./.env` via `conf
 | Variable | Default | Description |
 |---|---|---|
 | `GEMINI_API_KEY` | `""` | Google Gemini API key. |
-| `AI_MODEL_DEFAULT` | `gemini-2.0-flash` | Default fallback model identifier. |
-| `AI_MODEL_GEMINI` | `gemini-2.0-flash` | Gemini model used when routing to `gemini`. |
+| `AI_MODEL_DEFAULT` | `gemini-2.5-flash` | Default fallback model identifier. |
+| `AI_MODEL_GEMINI` | `gemini-2.5-flash` | Gemini model used when routing to `gemini`. |
 | `OPENAI_API_KEY` | `""` | OpenAI API key. |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Base URL for OpenAI or any OpenAI-compatible provider (Groq, Together, DeepSeek, OpenRouter, etc.). |
 | `AI_MODEL_OPENAI` | `gpt-4o-mini` | Model used by the `openai` adapter. |

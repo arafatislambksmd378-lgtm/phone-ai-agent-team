@@ -22,7 +22,7 @@ def main() -> int:
     checks: list[tuple[str, bool, str]] = []
 
     key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-2.0-flash"
+    model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-2.5-flash"
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     uid = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
     run_tg = os.getenv("RUN_TELEGRAM", "true").strip().lower() in {"1", "true", "yes"}

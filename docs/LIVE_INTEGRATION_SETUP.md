@@ -17,7 +17,7 @@ Add exactly these names:
 | `TELEGRAM_ALLOWED_USER_ID` | Secret | Your numeric Telegram user ID | Telegram authorization |
 
 Optional non-secret configuration: create a repository **variable** named `GEMINI_MODEL`
-(default `gemini-2.0-flash` if omitted).
+(default `gemini-2.5-flash` if omitted).
 
 The Android API token used by the sync test is generated randomly inside the runner; it is not a
 repository secret and is never printed. Do **not** add `API_AUTH_TOKEN`, GitHub tokens or any
