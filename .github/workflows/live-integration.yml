@@ -62,7 +62,15 @@ jobs:
         run: python scripts/live_preflight.py
 
       - name: Local automated tests (baseline, no live calls)
-        run: python -m pytest tests/ -q -o addopts=''
+        env:
+          RUN_LIVE_TESTS: '0'
+          GEMINI_API_KEY: ''
+          TELEGRAM_BOT_TOKEN: ''
+          TELEGRAM_ALLOWED_USER_ID: ''
+        run: |
+          mkdir -p live-evidence
+          set -o pipefail
+          python -m pytest tests/ -q -o addopts='' 2>&1 | tee live-evidence/local-tests.log
 
       - name: Real Gemini provider + real agent execution
         run: python scripts/live_provider_check.py
@@ -73,11 +81,13 @@ jobs:
 
       - name: Opt-in live pytest subset
         run: |
+          set -o pipefail
           if [ "$RUN_TELEGRAM" = "true" ]; then
-            python -m pytest tests/test_live_integrations.py -q -o addopts='' -k 'gemini or telegram'
+            SELECTOR='gemini or telegram'
           else
-            python -m pytest tests/test_live_integrations.py -q -o addopts='' -k 'gemini'
+            SELECTOR='gemini'
           fi
+          python -m pytest tests/test_live_integrations.py -q -o addopts='' -k "$SELECTOR" 2>&1 | tee live-evidence/live-pytest.log
 
       - name: Publish redacted evidence
         if: always()
