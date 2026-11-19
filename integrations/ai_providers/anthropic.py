@@ -8,15 +8,18 @@ class AnthropicAdapter(ProviderAdapter):
     supports_tools = True
     supports_json = True
 
-    def complete(self, system: str, user: str) -> dict:
+    def complete(self, system: str, user: str, *, max_tokens: int | None = None,
+                 temperature: float = 0.2) -> dict:
         if not self.available():
             return self._not_configured()
         if not self.model:
             return {"ok": False, "status": "BAD_REQUEST", "error": "anthropic: no model configured"}
         url = "https://api.anthropic.com/v1/messages"
+        tokens = max(256, int(max_tokens or self.max_tokens))
         payload = {
             "model": self.model,
-            "max_tokens": 2048,
+            "max_tokens": tokens,
+            "temperature": float(temperature),
             "system": system,
             "messages": [{"role": "user", "content": user}],
         }

@@ -1,4 +1,4 @@
-"""Provider adapter base — stdlib urllib, timeouts, retries, classification.
+"""Provider adapter base — stdlib urllib, timeouts, retries, Retry-After, classification.
 
 Result contract (always a dict):
   {"ok": True,  "text": ..., "provider": ..., "model": ...,
@@ -26,11 +26,13 @@ class ProviderAdapter:
     supports_tools: bool = False     # advisory: never used to hard-exclude a provider
     supports_json: bool = True
 
-    def __init__(self, api_key: str = "", model: str = "", timeout: int = 60, max_retries: int = 2):
+    def __init__(self, api_key: str = "", model: str = "", timeout: int = 60,
+                 max_retries: int = 2, max_tokens: int = 4096):
         self.api_key = api_key
         self.model = model
         self.timeout = timeout
         self.max_retries = max_retries
+        self.max_tokens = max(256, int(max_tokens or 4096))
 
     # ---- state ----
     def available(self) -> bool:
@@ -54,7 +56,7 @@ class ProviderAdapter:
         data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(
             url, data=data, method=method,
-            headers={"Content-Type": "application/json", "User-Agent": "phone-ai-agent-team/1.0",
+            headers={"Content-Type": "application/json", "User-Agent": "phone-ai-agent-team/2.0",
                      **(headers or {})})
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
@@ -71,6 +73,13 @@ class ProviderAdapter:
             except Exception:
                 pass
             detail = _scrub(detail, self.api_key)
+            retry_after = 0.0
+            try:
+                ra_hdr = (e.headers or {}).get("Retry-After") if getattr(e, "headers", None) else None
+                if ra_hdr:
+                    retry_after = min(float(ra_hdr), 15.0)
+            except (ValueError, TypeError):
+                retry_after = 0.0
             if e.code in (401, 403):
                 status = "AUTH_ERROR"
             elif e.code == 429:
@@ -81,8 +90,11 @@ class ProviderAdapter:
                 status = "SERVER_ERROR"
             else:
                 status = "UNKNOWN"
-            return {"ok": False, "status": status, "retryable": status in RETRYABLE,
-                    "http_status": e.code, "error": f"HTTP {e.code}: {detail}"[:500]}
+            out = {"ok": False, "status": status, "retryable": status in RETRYABLE,
+                   "http_status": e.code, "error": f"HTTP {e.code}: {detail}"[:500]}
+            if retry_after > 0:
+                out["retry_after"] = retry_after
+            return out
         except urllib.error.URLError as e:
             reason = str(getattr(e, "reason", e))
             status = "TIMEOUT" if "timed out" in reason.lower() else "CONNECTION_FAILED"
@@ -95,7 +107,7 @@ class ProviderAdapter:
                     "error": _scrub(f"{type(e).__name__}: {e}", self.api_key)[:300]}
 
     def _post_json(self, url: str, payload: dict, headers: dict | None = None) -> dict:
-        """POST with bounded exponential backoff for retryable statuses only."""
+        """POST with bounded exponential backoff (honoring Retry-After) for retryable statuses."""
         last = None
         for attempt in range(self.max_retries + 1):
             last = self._request(url, payload, headers)
@@ -103,13 +115,15 @@ class ProviderAdapter:
                 return last
             if not last.get("retryable") or attempt == self.max_retries:
                 return last
-            delay = min(2 ** attempt, 8)
-            log.info("%s: %s — retry %d/%d in %ss", self.name, last.get("status"),
+            delay = max(float(last.get("retry_after") or 0.0), float(min(2 ** attempt, 8)))
+            delay = min(delay, 15.0)
+            log.info("%s: %s — retry %d/%d in %.1fs", self.name, last.get("status"),
                      attempt + 1, self.max_retries, delay)
             time.sleep(delay)
         return last or {"ok": False, "status": "UNKNOWN", "error": "No attempt made"}
 
-    def complete(self, system: str, user: str) -> dict:
+    def complete(self, system: str, user: str, *, max_tokens: int | None = None,
+                 temperature: float = 0.2) -> dict:
         raise NotImplementedError
 
     # ---- helpers ----
