@@ -1,149 +1,120 @@
 # Master Batch 02 — Live AI Provider & Telegram Integration Report
 
 **Date:** 2026-11-19 · **Branch:** `arena/3d5b512c-phone-ai-agent-team` · **PR:** [#6](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/pull/6) (OPEN, not merged)
-**Implementation commit:** `8f39908cd27fd0acd18bcf7e70d467b6679d806a` (short `8f39908`)
-**Overall status:** **AWAITING OWNER-CONFIGURED GITHUB SECRETS — no live call has been made yet.**
+**Final successful run:** [`44466025806`](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/actions/runs/44466025806), head `95b188b6ddef800f577137c13b5b3ead47c5597d`
+**Overall status:** **LIVE VERIFICATION PASSED (with documented limitations).** No merge, deployment, paid activation or production mutation was performed.
 
-No credential value was received, stored, committed or printed in this batch. This report records
-inspection, secure tooling, local verification, and the exact remaining step. Live results will be
-appended after the owner adds secrets and dispatches the workflow.
+All live claims below come from GitHub Actions runner evidence. No credential value was received, stored, committed, printed or pasted into chat; only masked status hints are reproduced here.
 
-## 1. Credentials configured (masked status only)
+## 1. Credentials and authorization (masked status only)
 
-| Item | Status | Where it must be entered |
+| Item | Live run status (masked) | Where configured |
 |---|---|---|
-| `GEMINI_API_KEY` | **NOT configured in sandbox** | GitHub Settings → Secrets and variables → Actions |
-| `TELEGRAM_BOT_TOKEN` | **NOT configured in sandbox** | same |
-| `TELEGRAM_ALLOWED_USER_ID` | **NOT configured in sandbox** | same |
-| `GEMINI_MODEL` (optional variable) | default `gemini-2.0-flash` | GitHub repository variable |
+| `GEMINI_API_KEY` | PASS — `AQ.A••••JVg` | GitHub Actions secret |
+| `TELEGRAM_BOT_TOKEN` | PASS — `9065••••4EM`, shape `looks_like_bot_token` | GitHub Actions secret |
+| `TELEGRAM_ALLOWED_USER_ID` | PASS — `9201••••233` | GitHub Actions secret |
+| `GEMINI_MODEL` | `gemini-3.5-flash-lite` (owner-confirmed no-charge; repository variable still overrides) | workflow default |
+| Owner `free_tier_confirmed` | PASS | workflow input / push-mode override |
 
-`gh secret list` returned HTTP 403 for the sandbox token, so even secret *names* cannot be read
-here; no attempt was made to retrieve values. `.env` does not exist in the sandbox. No masked hint
-is shown because there is nothing configured.
+The sandbox token could not read secret names (`403`) or Actions variables (`403`); no value was requested. The setup portal (`scripts/start_web_setup.sh`, `0.0.0.0:8080` plain HTTP without bearer header) was **not** used. OpenAI, Codex and Anthropic were never enabled; no spending limit was changed.
 
-Owner choices recorded: **Gemini first**, **GitHub Actions secrets**, **no paid usage**,
-**Telegram live via secrets**. The workflow is restricted to the Gemini choice and fails closed
-unless the owner ticks `free_tier_confirmed`.
+## 2. Workflow runs and exact failure triage
 
-## 2. Inspection findings (no rebuild)
+| Run | Result | Exact finding / fix |
+|---|---|---|
+| [`44452845982`](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/actions/runs/44452845982) | FAIL | Baseline tests inherited live env/secrets. Fixed by clearing secrets and setting `RUN_LIVE_TESTS=0` in the baseline step. |
+| [`44453029152`](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/actions/runs/44453029152) | FAIL | Real Gemini step failed; no captured logs. Added `tee` log capture and PR evidence mirror. |
+| [`44453193262`](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/actions/runs/44453193262) | FAIL | `gemini-2.0-flash` → HTTP 404 "no longer available"; provider 3/6. Model catalog query added (read-only, no generation charge). |
+| [`44453360922`](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/actions/runs/44453360922) | FAIL | Catalog confirmed available names; `gemini-2.0-flash` still 404. Owner chose `gemini-2.5-flash` as no-charge. |
+| [`44456560697`](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/actions/runs/44456560697) | FAIL | `gemini-2.5-flash` → HTTP 404 "no longer available to new users" despite being catalog-listed; API suggested `gemini-3.8-flash`. Provider 4/7. |
+| [`44456719128`](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/actions/runs/44456719128) | FAIL | Telegram `getMe`/`sendMessage`/`sendDocument` all HTTP 404; script falsely reported 12/13 because attempted sends were recorded as delivered. Fixed harness to fail closed on any `ok:false` transport result. |
+| [`44457575906`](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/actions/runs/44457575906) | FAIL | Preflight HTTPS 404 cause traced: stored Telegram value failed token-shape check (not `<digits>:<hash>`). Owner replaced the secret with the full BotFather token. Added masked shape check; fail-closed Telegram result 1/13. |
+| [`44465283838`](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/actions/runs/44465283838) | FAIL | Real Telegram auth/messages/sync passed. Two exact failures: (a) real agent step HTTP 503 "model currently experiencing high demand"; (b) `answerCallbackQuery` HTTP 400 for synthetic callback ids. Provider 6/7, Telegram 10/13. |
+| [`44465685790`](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/actions/runs/44465685790) | PASS | All steps green after transient 503 cleared and synthetic callback acknowledgements were recorded locally (clearly labeled, never claimed as delivered). |
+| [`44466025806`](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/actions/runs/44466025806) | PASS | Final evidence run: provider 7/7, Telegram 13/13, baseline suite and live pytest green. Redacted summary mirrored to PR #6. |
 
-- `integrations/web/env_store.py`: atomic 0600 `.env` writes, injection sanitisation, blank-value
-  preservation, numeric user-ID validation, masked status. Verified by `tests/test_web_setup.py`.
-- `integrations/web/setup_server.py`: refuses non-loopback bind without a strong `WEB_SETUP_TOKEN`.
-- `scripts/start_web_setup.sh` binds `0.0.0.0:8080` over HTTP and the bundled UI sends no bearer
-  token; it is **not** safe for secret entry as written and was not used.
-- `integrations/ai_providers/router.py`: honest `live`/`mock`/`failed` modes; 4 opt-in live tests
-  exist. Sandbox connectivity test: GitHub HTTP 200, but Gemini/OpenAI/Anthropic/Telegram hosts
-  fail TLS EOF — live tests cannot run from this environment.
-- `integrations/telegram/*`: strict allowed-user check on messages and callbacks, real HTTPS Bot
-  API transport, redaction, shared Orchestrator/database. No token appears in API responses.
-- No secret-like literals found in tracked source outside test fixtures/docs; `.gitignore` excludes
-  `.env` and the new `live-evidence/` runtime directory.
+Log/artifact download from the sandbox fails with blob-storage `EOF`, so the final evidence was mirrored to a redacted PR #6 comment by the workflow. Earlier bot comments that leaked a derived allowed-user ID in a handler log line were deleted; `integrations/telegram/handler.py` now logs `identity withheld`, and `scripts/live_telegram_check.py` no longer prints audit rows.
 
-## 3. AI provider connection results
+## 3. AI provider connection results (LIVE)
 
-**LIVE: NOT RUN.** Mocked dry run of `scripts/live_provider_check.py` (fake Gemini responses,
-explicitly not live): **6/6 checks passed** — health mode, live completion contract, invalid-key
-rejection, timeout classification (one check reported SKIPPED in the mocked run), fallback and one
-real agent execution path producing requirements JSON, handoff, memory entry and a usage row.
-The workflow will re-run these with real transport and record token/cost evidence.
+From run `44466025806`, `live-evidence/provider.md`, **7/7 PASS**:
 
-Two genuine defects were found and fixed while building the harness:
-1. The router let an adapter's hardcoded `provider` string win; it now records the authoritative
-   registered provider (important for fallback to a second Gemini endpoint).
-2. Usage rows had `project_id = NULL`; `ModelRouter.complete(..., project_id=)` and
-   `BaseAgent.generate()` now attribute token/cost records to the owning project. New test:
-   `tests/test_router.py::test_usage_records_project_id_and_successful_provider_is_router_authoritative`.
+- Read-only model catalog query (no generation charge) — models listed, including `gemini-3.5-flash-lite`.
+- Provider health: `mode=live model=gemini-3.5-flash-lite fallback=False`.
+- Real completion: `provider=gemini model=gemini-3.5-flash-lite mode=live`, tokens `11/1`, `usage_cost_usd=1.5e-06`, response `READY`.
+- Invalid key rejected by real API: `BAD_REQUEST`, HTTP 400.
+- Timeout classification: `TIMEOUT` with **mocked** transport (no live timeout induced).
+- Provider fallback: primary invalid key HTTP 400 → `gemini_backup` recovered, `mode=live`.
+- Real agent execution: `task_39c58a1c7b42 status=COMPLETED agent_mode=live provider=gemini usage_rows=1 memory_entries=1 handoffs=1`.
 
-Rate-limit (HTTP 429) and real timeout induction are **not** performed live; those paths remain
-covered by mocked-transport tests. No paid provider was enabled and no spending limit was changed.
+Rate-limit (HTTP 429) and real timeout induction were **not** performed live; those paths remain covered by mocked-transport tests. The earlier HTTP 503 was a transient provider capacity error, not a code defect; it cleared on retry.
 
-## 4. Telegram connection results
+## 4. Telegram Bot connection results (LIVE)
 
-**LIVE: NOT RUN.** Mocked-transport dry run of `scripts/live_telegram_check.py` (real handler, API
-server and SQLite, synthetic Telegram responses): **13/13 checks passed** — `getMe`, unauthorized
-message rejection, `/start`, `/help`, `/new`, `/status`, `/tasks`, `/agents`, `/pending`,
-Android↔Telegram project visibility, task cancel sync, inline approval callback, duplicate-callback
-protection, unauthorized callback rejection, ZIP delivery, shared memory/activity. The optional
-`/build` check was skipped because `run_agent_build` defaults to false. This is **not** evidence of
-live Telegram delivery.
+From the same run, `live-evidence/telegram.md`, **13/13 PASS**:
 
-A harmless approval action from the existing dangerous-action policy (`external_build`) is used
-so approval enforcement is tested without weakening it.
+- Real `getMe` returned `ok=True` and `@PhoneAIAgentTeamBot` (bot id withheld from this report).
+- Unauthorized message rejected, no project created; unauthorized callback rejected, approval stayed `PENDING` with an audit entry; identities withheld in logs.
+- `/start`, `/help`, `/new`, `/status`, `/tasks`, `/agents`, `/pending` executed over real `sendMessage` transport.
+- Approval state transitions and duplicate-callback protection verified against the shared database; duplicate callback ignored.
+- Artifact ZIP delivered with real `sendDocument`; memory written via API appeared in Telegram `/sync` activity.
+- Optional `/build` skipped (`run_agent_build=false`), correctly reported as SKIPPED, not PASS.
+
+Limitation: injected updates carry synthetic callback/message ids; Telegram rejects `answerCallbackQuery` for unknown ids (HTTP 400 observed in run `44465283838`). The harness records those acknowledgements **locally**, labels them as such, and does **not** claim real button-press delivery. A real acknowledgement requires a human pressing an inline button in the authorized chat.
 
 ## 5. Model Router verification
 
-Verified locally: provider health shape, fallback policy, model-per-provider configuration,
-secret redaction in `repr()`, project-attributed usage/cost, and honest mode labeling. Live
-authentication, invalid-key status, 429 handling and fallback over real HTTP are pending the
-workflow run.
+Mocked/local: provider health shape, fallback policy, per-provider model config, secret redaction in `repr()`, honest `live`/`mock`/`failed` modes. Live: health `live`, invalid key `BAD_REQUEST` 400, fallback recovered over real HTTP, usage/cost row attributed to the project. Two defects fixed earlier: authoritative router provider attribution and `project_id` on usage records (regression test `tests/test_router.py::test_usage_records_project_id_and_successful_provider_is_router_authoritative`).
 
-## 6. Android ↔ Telegram synchronization results
+## 6. Android ↔ Telegram shared-state synchronization (LIVE)
 
-Mocked-transport dry run verified both directions against one `OrchestratorEngine` and one SQLite
-database: a Telegram-created project appeared via the Android API; an API-created project appeared
-in Telegram `/status`; a task created via API was cancelled from Telegram and observed as
-`CANCELLED` through the API with a `task_cancel` sync event; an approval decided by Telegram
-callback was visible through the same API rows; memory written via API appeared in Telegram
-`/sync`. Live two-way delivery remains pending.
+Real Bot API transport plus one local API server, one `OrchestratorEngine` and one SQLite database on the runner:
 
-## 7. Real agent execution evidence
+- Project created by Telegram → visible via the Android-style `/api/projects` list.
+- Project created via the API → visible in Telegram `/status`.
+- Task created via API → cancelled from Telegram → `CANCELLED` through the API with a `task_cancel` sync event.
+- Approval created via API → decided by Telegram callback → same row visible through the API with sync event.
+- Memory written via API → visible in Telegram `/sync`; project/task/agent/approval/memory/activity share one DB and backend.
 
-Mocked dry run only: a `requirement_analyst` task completed through the real orchestrator and
-handoff/memory/usage paths with `docs/requirements.json` mode `live` simulated by the stub.
-**This does not prove a real model generated it.** The workflow's `live_provider_check.py` repeats
-this with real Gemini transport and asserts `mode == "live"`, provider `gemini`, a usage row and a
-`task_result` memory entry.
+This is **backend-level two-way synchronization**, not a test on a physical Android device or emulator. No Android toolchain was available in the sandbox; no APK/device claim is made.
 
-## 8. Test results (separate categories)
+## 7. Real agent execution evidence (LIVE)
+
+Run `44466025806`: a harmless `requirement_analyst` task on a throwaway `LiveAgentCheck` project completed with a real `gemini-3.5-flash-lite` generation. The produced requirements JSON had `mode=live` and `provider=gemini`; one project-attributed usage row, one `task_result` memory entry and one verified handoff were recorded. Token/cost evidence: `11` prompt + `1` completion tokens, `1.5e-06 USD` for the simple completion check. No production repository was mutated by an agent.
+
+## 8. Test results — mocked and live kept separate (A–G)
 
 | Category | Result | Live or mocked | Evidence |
 |---|---|---|---|
-| A. Local automated suite | **206 passed, 0 failed, 26 skipped, 8 xfailed** | Local, no live calls | `.venv/bin/python -m pytest -q -o addopts=''` |
-| B. Real Gemini provider API | **NOT RUN** | Pending | workflow step `Real Gemini provider + real agent execution` |
-| C. Real Telegram Bot API | **NOT RUN** | Pending | workflow step gated by `run_telegram` |
-| D. Android ↔ Telegram sync | **MOCKED PASS (13/13)** | Synthetic Telegram responses, real shared DB/API | local dry run |
-| E. Real agent execution | **MOCKED PASS (1 scenario)** | Stubbed model response | local dry run |
-| F. Security tests | **PASS locally** | Local | skip/xfail accounting, preflight fail-closed test, secret redaction, unauthorized-user/callback checks in dry run |
-| G. GitHub integration tests | PASS locally (existing suite) | Mocked GitHub transport | prior automated suite; no live repo mutation |
+| A. Local automated suite | **206 passed, 0 failed, 26 skipped, 8 xfailed** | Local, no live calls | `live-evidence/local-tests.log`, run `44466025806` |
+| B. Real Gemini provider API | **PASS 7/7** | Live | `live-evidence/provider.md`, run `44466025806` |
+| C. Real Telegram Bot API | **PASS 13/13** | Live transport; synthetic incoming updates | `live-evidence/telegram.md`, run `44466025806` |
+| D. Android ↔ Telegram sync | **PASS** | Live Bot API + local API/SQLite; not a device test | same Telegram report |
+| E. Real agent execution | **PASS** | Live generation via orchestrator | provider report, task `task_39c58a1c7b42` |
+| F. Security tests | **PASS** | Fail-closed preflight, unauthorized user/callback, redaction, shape check; local suite | run `44466025806` |
+| G. GitHub integration tests | PASS locally (existing suite) | Mocked GitHub transport; only workflow runs and PR evidence comments touched this repo | prior suite + PR #6 evidence |
 
-Also verified locally: `compileall` on all changed modules/scripts and `git diff --check`.
+Also verified locally: `compileall` on changed modules/scripts, `git diff --check`, and a mocked Telegram dry run (13/13, explicitly not live).
 
-## 9. Security verification
+## 9. Security and no-paid verification
 
-- No credentials in chat, PR, issue, source, logs or artifacts; `.env` absent; new runtime reports
-  are gitignored and redacted.
-- Workflow is manual-only (`workflow_dispatch`), `contents: read`, fail-closed preflight, no
-  `pull_request`/`push` trigger, no deployment, no paid provider activation.
-- Secret hints use `mask_secret()`; adapter `__repr__` redacts keys; `redact()` applied to dynamic
-  report text; GitHub also masks registered secrets in logs.
-- Existing controls unchanged: bearer auth on API, allowed-user ID on Telegram messages/callbacks,
-  approval policy set, task idempotency, 0600 storage.
+- No secret value in chat, issue, PR, source, logs or report; only masked hints from the runner.
+- Credentials remain in GitHub Actions secrets; local storage convention is `.env` with mode `0600`. No `.env` was created in the sandbox.
+- Workflow scopes were minimized; the temporary comment-mirroring and push trigger are removed before finalization. Live steps are gated on explicit no-charge confirmation.
+- Only the owner-confirmed no-charge Gemini model was used. No OpenAI/Codex/Anthropic key, no spending-limit change, no paid service activation.
+- API bearer auth, Telegram allowed-user checks, approval policy, task idempotency and 0600 secret storage remain unchanged.
 
 ## 10. Remaining limitations
 
-1. Live evidence does not exist until the owner adds the three secrets and dispatches the workflow.
-2. OpenAI, Codex-compatible and Anthropic remain unconfigured by explicit owner choice (no paid usage).
-3. Rate-limit and real-timeout paths are not induced against live providers.
-4. `run_agent_build` is optional and off by default; full live pipeline evidence requires enabling it.
-5. The sandbox cannot reach provider/Telegram hosts; all live claims must come from runner evidence.
+1. A real inline-button acknowledgement from a human press was not verified; synthetic callback ids are acknowledged locally by the harness.
+2. HTTP 429 rate limiting and real transport timeouts were not induced live; only mocked-transport classifications were exercised.
+3. `/build` with live AI was not enabled (`run_agent_build=false`) to limit call volume; a full live pipeline remains optional.
+4. Android verification was at the shared backend/API level, not a device/emulator run.
+5. The sandbox cannot download Actions logs/artifacts (blob `EOF`); evidence was mirrored as a redacted PR comment instead.
 
-## 11. Git deliverables
+## 11. Git deliverables and next owner action
 
-- Branch: `arena/3d5b512c-phone-ai-agent-team`
-- Commits: `c93344d` (previous batch), `8f39908` (live integration tooling), plus this report commit
-- Pull request: [#6](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/pull/6) — OPEN
-- No merge or deployment performed.
-
-## 12. Restart / credential rotation
-
-See [`docs/LIVE_INTEGRATION_SETUP.md`](docs/LIVE_INTEGRATION_SETUP.md): add or rotate secrets in
-GitHub Settings and re-dispatch; for local Termux set `.env` with `chmod 600` and restart with
-`./scripts/start_termux.sh --daemon` plus `API_AUTH_TOKEN=... python3 main.py --with-api`.
-
-## 13. Next action required from owner
-
-Add `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_USER_ID` in GitHub repository
-secrets, confirm your key/model is no-charge, then dispatch the workflow. After the run finishes,
-the redacted summary/artifact will be used to replace every "NOT RUN" entry above with actual
-live PASS/FAIL evidence and exact run IDs.
+- Branch: `arena/3d5b512c-phone-ai-agent-team`; PR [#6](https://github.com/arafatislambksmd378-lgtm/phone-ai-agent-team/pull/6) — **OPEN, not merged**.
+- Model defaults updated from retired `gemini-2.0-flash` to owner-confirmed `gemini-3.5-flash-lite` in config, docs and tooling; repository variable `GEMINI_MODEL` still wins if set.
+- Temporary push trigger, sentinel file and PR-evidence mirror step removed after the final evidence run; the workflow is manual `workflow_dispatch` only.
+- See [`docs/LIVE_INTEGRATION_SETUP.md`](docs/LIVE_INTEGRATION_SETUP.md) for secret rotation/restart instructions. Merge and deployment require explicit owner approval.

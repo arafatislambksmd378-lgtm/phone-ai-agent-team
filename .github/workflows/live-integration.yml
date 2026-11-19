@@ -3,14 +3,6 @@ name: Live Integration Verification (owner-authorized, manual)
 # Manual only. Never runs on push/PR. Secrets are supplied by the owner through
 # GitHub Settings -> Secrets and variables -> Actions. No credential is stored in Git.
 on:
-  # TEMPORARY branch-only trigger: GitHub only exposes workflow_dispatch for workflows
-  # present on the default branch. This lets the same workflow run from PR #6's branch
-  # without merging. Remove this block and the sentinel after the run.
-  push:
-    branches:
-      - arena/3d5b512c-phone-ai-agent-team
-    paths:
-      - live-run-trigger
   workflow_dispatch:
     inputs:
       provider:
@@ -34,7 +26,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write   # only to post redacted verification evidence on PR #6
 
 jobs:
   live-verification:
@@ -49,9 +40,9 @@ jobs:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_ALLOWED_USER_ID: ${{ secrets.TELEGRAM_ALLOWED_USER_ID }}
       RUN_LIVE_TESTS: '1'
-      FREE_TIER_CONFIRMED: ${{ github.event_name == 'push' && 'true' || inputs.free_tier_confirmed }}
-      RUN_TELEGRAM: ${{ github.event_name == 'push' && 'true' || inputs.run_telegram }}
-      RUN_AGENT_BUILD: ${{ github.event_name == 'push' && 'false' || inputs.run_agent_build }}
+      FREE_TIER_CONFIRMED: ${{ inputs.free_tier_confirmed }}
+      RUN_TELEGRAM: ${{ inputs.run_telegram }}
+      RUN_AGENT_BUILD: ${{ inputs.run_agent_build }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -78,21 +69,21 @@ jobs:
           python -m pytest tests/ -q -o addopts='' 2>&1 | tee live-evidence/local-tests.log
 
       - name: Real Gemini provider + real agent execution
-        if: always()
+        if: ${{ always() && env.FREE_TIER_CONFIRMED == 'true' }}
         run: |
           set -o pipefail
           mkdir -p live-evidence
           python scripts/live_provider_check.py 2>&1 | tee live-evidence/provider-run.log
 
       - name: Real Telegram Bot + Android synchronization
-        if: ${{ always() && (inputs.run_telegram || github.event_name == 'push') }}
+        if: ${{ always() && env.FREE_TIER_CONFIRMED == 'true' && inputs.run_telegram }}
         run: |
           set -o pipefail
           mkdir -p live-evidence
           python scripts/live_telegram_check.py 2>&1 | tee live-evidence/telegram-run.log
 
       - name: Opt-in live pytest subset
-        if: always()
+        if: ${{ always() && env.FREE_TIER_CONFIRMED == 'true' }}
         run: |
           set -o pipefail
           if [ "$RUN_TELEGRAM" = "true" ]; then
@@ -120,27 +111,3 @@ jobs:
           name: live-integration-evidence
           path: live-evidence/
           if-no-files-found: warn
-
-      # TEMPORARY branch-run evidence mirror: the sandbox cannot download Actions
-      # artifacts/logs (blob storage EOF), so publish only masked reports to PR #6.
-      # Remove this step together with the temporary push trigger before merge.
-      - name: Post redacted verification summary to PR #6
-        if: always() && github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          {
-            echo "## Live integration evidence (redacted)"
-            echo "Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-            echo "Head: ${GITHUB_SHA}"
-            for f in live-evidence/*.md; do
-              [ -f "$f" ] || continue
-              echo "===== $f ====="
-              cat "$f"
-            done
-            echo "===== check summaries ====="
-            grep -h '^RESULT:' live-evidence/*.log 2>/dev/null || true
-            tail -n 2 live-evidence/local-tests.log 2>/dev/null || true
-            tail -n 2 live-evidence/live-pytest.log 2>/dev/null || true
-          } > /tmp/verification-summary.md
-          gh pr comment 6 --body-file /tmp/verification-summary.md
