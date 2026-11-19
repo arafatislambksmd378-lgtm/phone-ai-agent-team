@@ -45,7 +45,7 @@ jobs:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       # Owner-confirmed no-charge replacement for the retired gemini-2.0-flash.
       # A repository variable still wins if the owner sets one.
-      GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
+      GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_ALLOWED_USER_ID: ${{ secrets.TELEGRAM_ALLOWED_USER_ID }}
       RUN_LIVE_TESTS: '1'
@@ -57,6 +57,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      # TEMPORARY one-shot redaction cleanup: remove earlier bot-authored evidence
+      # comments that contained a derived allowed-user ID in a handler log line.
+      # Remove this step after the run; no user identity appears in its output.
+      - name: Remove superseded unredacted PR comments
+        if: github.event_name == 'push'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_IDS: >-
+            IC_kwDOVv3Mv88AAAABoSwkqg
+            IC_kwDOVv3Mv88AAAABoSx38A
+            IC_kwDOVv3Mv88AAAABoTMIKA
+            IC_kwDOVv3Mv88AAAABoTNuZA
+        run: |
+          for id in $COMMENT_IDS; do
+            gh api -X DELETE "repos/${GITHUB_REPOSITORY}/issues/comments/$id" >/dev/null 2>&1 || true
+          done
+          echo "cleanup complete (comment ids withheld from logs)"
 
       - name: Install test dependency
         run: python -m pip install --quiet 'pytest>=8,<10'

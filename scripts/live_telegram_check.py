@@ -37,19 +37,32 @@ class RecordingBot(TelegramBot):
         self.answers: list[str] = []
         self.docs: list[dict] = []
 
+    @staticmethod
+    def _checked(result, action: str) -> dict:
+        # Fail closed: an attempted call that the Bot API rejected is NOT delivery.
+        if not result.get("ok"):
+            raise AssertionError(f"Telegram {action} rejected: {str(result.get('error'))[:160]}")
+        return result
+
     def send_message(self, chat_id, text, reply_markup=None):
-        result = super().send_message(chat_id, text, reply_markup)
+        result = self._checked(super().send_message(chat_id, text, reply_markup), "sendMessage")
         self.sent.append(str(text))
         return result
 
+    def clear_inline_buttons(self, chat_id, message_id):
+        return self._checked(super().clear_inline_buttons(chat_id, message_id),
+                             "editMessageReplyMarkup")
+
     def answer_callback_query(self, callback_query_id, text="", show_alert=False):
-        result = super().answer_callback_query(callback_query_id, text, show_alert)
+        result = self._checked(
+            super().answer_callback_query(callback_query_id, text, show_alert),
+            "answerCallbackQuery")
         self.answers.append(str(text))
         return result
 
     def send_document(self, chat_id, file_path, caption=""):
-        result = super().send_document(chat_id, file_path, caption)
-        self.docs.append({"file": Path(file_path).name, "result": bool(result.get("ok"))})
+        result = self._checked(super().send_document(chat_id, file_path, caption), "sendDocument")
+        self.docs.append({"file": Path(file_path).name, "result": True})
         return result
 
 
@@ -219,7 +232,9 @@ def main() -> int:
         handler(bot, callback_update("cb-live-bad", f"approve:{aid}", uid + 1, uid))
         assert engine.db.get_approval(aid)["status"] == "PENDING", engine.db.get_approval(aid)
         logs = engine.db.list_approval_audit_logs(pid, limit=50)
-        assert any("unauthorized" in str(row).lower() for row in logs), logs[-3:]
+        # Never print audit rows: they contain the probe user id.
+        assert any("unauthorized" in str(row).lower() for row in logs), \
+            "no unauthorized-approval audit entry recorded"
         return "unauthorized callback rejected; approval still PENDING"
 
     def artifact_and_memory() -> str:

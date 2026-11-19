@@ -42,7 +42,7 @@ def settings_for(db_path: Path, ws: Path, *, fallback: bool = False) -> Settings
     return Settings(
         gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
         openai_api_key="", codex_api_key="", anthropic_api_key="",
-        ai_model_gemini=os.getenv("GEMINI_MODEL", "") or "gemini-2.5-flash",
+        ai_model_gemini=os.getenv("GEMINI_MODEL", "") or "gemini-3.5-flash-lite",
         ai_provider_order=["gemini"],
         allow_provider_fallback=fallback,
         ai_timeout_seconds=30,
@@ -54,7 +54,7 @@ def settings_for(db_path: Path, ws: Path, *, fallback: bool = False) -> Settings
 
 def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
-    model = os.getenv("GEMINI_MODEL", "") or "gemini-2.5-flash"
+    model = os.getenv("GEMINI_MODEL", "") or "gemini-3.5-flash-lite"
     db_path = OUT / "provider.db"
     ws = OUT / "workspace"
     ws.mkdir(parents=True, exist_ok=True)

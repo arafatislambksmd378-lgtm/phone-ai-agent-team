@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -22,7 +23,7 @@ def main() -> int:
     checks: list[tuple[str, bool, str]] = []
 
     key = os.getenv("GEMINI_API_KEY", "").strip()
-    model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-2.5-flash"
+    model = os.getenv("GEMINI_MODEL", "").strip() or "gemini-3.5-flash-lite"
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     uid = os.getenv("TELEGRAM_ALLOWED_USER_ID", "").strip()
     run_tg = os.getenv("RUN_TELEGRAM", "true").strip().lower() in {"1", "true", "yes"}
@@ -33,6 +34,11 @@ def main() -> int:
     checks.append(("Owner free/no-charge confirmation", confirmed, "workflow input"))
     if run_tg:
         checks.append(("Telegram bot token", bool(token), mask_secret(token)))
+        # Shape only. A syntactically valid token can still be revoked; getMe is the
+        # authoritative check. The value itself is never printed.
+        token_shape = bool(re.fullmatch(r"\d{5,}:[A-Za-z0-9_-]{20,}", token))
+        checks.append(("Telegram token shape", token_shape,
+                       "looks_like_bot_token" if token_shape else "unexpected_format"))
         checks.append(("Telegram allowed user ID", uid.isdigit(), mask_secret(uid)))
 
     lines = ["# Live integration preflight", "",

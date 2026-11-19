@@ -255,7 +255,7 @@ SETUP_HTML = r"""<!DOCTYPE html>
             <button type="button" class="icon-btn danger" data-clear="GEMINI_API_KEY">Clear</button>
           </div>
           <label for="in-AI_MODEL_GEMINI">Model (AI_MODEL_GEMINI)</label>
-          <input id="in-AI_MODEL_GEMINI" type="text" placeholder="gemini-2.5-flash" />
+          <input id="in-AI_MODEL_GEMINI" type="text" placeholder="gemini-3.5-flash-lite" />
         </div>
 
         <!-- OpenAI -->

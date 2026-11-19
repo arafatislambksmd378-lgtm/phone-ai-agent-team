@@ -99,13 +99,13 @@ class TelegramHandler:
                 self.engine.approvals.record_unauthorized(aid, actor=str(uid or "unknown"), detail=data)
                 if cb.get("id"):
                     bot.answer_callback_query(cb["id"], "⛔ Not authorized.", show_alert=True)
-                log.warning("rejected unauthorized callback_query from user %s", uid)
+                log.warning("rejected unauthorized callback_query (identity withheld)")
                 return
             msg = update.get("message") or update.get("edited_message") or {}
             chat = (msg.get("chat") or {}).get("id")
             if chat:
                 bot.send_message(chat, "⛔ Not authorized.")
-                log.warning("rejected unauthorized update from user %s", uid)
+                log.warning("rejected unauthorized update (identity withheld)")
             return
 
         if "callback_query" in update:
